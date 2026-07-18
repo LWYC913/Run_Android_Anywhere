@@ -1,0 +1,17 @@
+extends:
+  - recommended
+
+apis:
+  v1:
+    root: ./openapi/v1.yaml
+
+rules:
+  # Worker-protocol schemas intentionally live beside the HTTP contract so the
+  # Rust/OpenAPI drift test can compare every shared DTO, even when no public
+  # HTTP operation consumes them directly.
+  no-unused-components: off
+  operation-4xx-response: error
+  operation-operationId: error
+  operation-summary: error
+  security-defined: error
+  spec-strict-refs: error

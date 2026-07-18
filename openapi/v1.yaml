@@ -1,0 +1,1561 @@
+openapi: 3.1.0
+jsonSchemaDialect: https://json-schema.org/draft/2020-12/schema
+info:
+  title: Run Anywhere API
+  version: 1.0.0
+  summary: Contract-first API for self-hosted Android emulator jobs.
+  description: |
+    The v1 control-plane contract for projects, signed uploads, Android emulator
+    jobs, lifecycle events, artifacts, browser debug sessions, webhooks, workers,
+    and runtime profiles.
+
+    Every operation requires an HTTP bearer token. The `x-required-scopes`
+    extension records the API-key scope enforced by the future implementation.
+  license:
+    name: MIT
+    identifier: MIT
+servers:
+  - url: https://api.run-anywhere.example
+    description: Example deployment
+tags:
+  - name: Projects
+    description: Project namespaces and initial credentials.
+  - name: Uploads
+    description: Short-lived signed object-storage uploads.
+  - name: Jobs
+    description: Android emulator job submission and lifecycle.
+  - name: Artifacts
+    description: Files and metadata produced by jobs.
+  - name: Debug sessions
+    description: Short-lived browser viewer or controller sessions.
+  - name: Webhooks
+    description: Project callback registration.
+  - name: Administration
+    description: Worker and runtime-profile inventory.
+security:
+  - BearerAuth: []
+x-worker-protocol-schemas:
+  registration:
+    $ref: '#/components/schemas/WorkerRegistration'
+  heartbeat:
+    $ref: '#/components/schemas/WorkerHeartbeat'
+  job_queued:
+    $ref: '#/components/schemas/JobQueued'
+  job_claim:
+    $ref: '#/components/schemas/JobClaim'
+  job_lease_extension:
+    $ref: '#/components/schemas/JobLeaseExtension'
+  job_result:
+    $ref: '#/components/schemas/JobResult'
+x-state-machine-schemas:
+  transition_evidence:
+    $ref: '#/components/schemas/TransitionEvidence'
+paths:
+  /v1/projects:
+    post:
+      operationId: createProject
+      summary: Create a project
+      description: Creates a project namespace and returns its first API key once.
+      tags: [Projects]
+      x-required-scopes: [admin]
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateProjectRequest'
+            example:
+              name: Mobile QA
+      responses:
+        '201':
+          description: Project created; the plaintext API key is returned only in this response.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CreateProjectResponse'
+              example:
+                project:
+                  id: proj_mobile_qa
+                  name: Mobile QA
+                  owner: bootstrap-admin
+                  created_at: '2026-07-13T08:30:00Z'
+                api_key: ra_live_example_secret
+                scopes: [project:read, project:write, debug:create]
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+        '403':
+          $ref: '#/components/responses/ForbiddenError'
+        '409':
+          $ref: '#/components/responses/ConflictError'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /v1/uploads/apk:
+    post:
+      operationId: createUpload
+      summary: Create a signed upload
+      description: Creates upload metadata and returns a short-lived signed PUT URL.
+      tags: [Uploads]
+      x-required-scopes: [project:write]
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateUploadRequest'
+            example:
+              project_id: proj_mobile_qa
+              kind: apk
+              file_name: app-debug.apk
+              content_type: application/vnd.android.package-archive
+              size_bytes: 18423377
+              sha256: 3a7bd3e2360a3d80e1797c5c2b7961e57092b45f72f874b4fbd02b5e35d7a64c
+      responses:
+        '201':
+          description: Upload metadata and signed URL created.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CreateUploadResponse'
+              example:
+                upload_id: upl_app_debug
+                upload_url: https://objects.example/uploads/upl_app_debug?signature=example
+                required_headers:
+                  Content-Type: application/vnd.android.package-archive
+                expires_at: '2026-07-13T08:45:00Z'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+        '403':
+          $ref: '#/components/responses/ForbiddenError'
+        '404':
+          $ref: '#/components/responses/NotFoundError'
+        '409':
+          $ref: '#/components/responses/ConflictError'
+        '429':
+          $ref: '#/components/responses/QuotaExceededError'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/InfrastructureError'
+
+  /v1/jobs:
+    post:
+      operationId: createJob
+      summary: Create a job
+      description: Creates one emulator job. Reusing the same idempotency key returns the original job.
+      tags: [Jobs]
+      x-required-scopes: [project:write]
+      security:
+        - BearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateJobRequest'
+            example:
+              project_id: proj_mobile_qa
+              apk_upload_id: upl_app_debug
+              test_upload_id: upl_login_tests
+              runtime_profile: rtp_android_35_pixel_6_x86_64
+              mode: headless_ci
+              min_isolation: vm_isolated
+              automation:
+                type: appium
+                script_ref: s3://mobile-qa/tests/login-flow.zip
+              artifacts:
+                screenshots: true
+                video: true
+                logcat: true
+                junit: true
+              timeout_seconds: 900
+      responses:
+        '202':
+          description: Job accepted and queued.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Job'
+              example:
+                id: job_login_flow
+                project_id: proj_mobile_qa
+                apk_upload_id: upl_app_debug
+                test_upload_id: upl_login_tests
+                runtime_profile: rtp_android_35_pixel_6_x86_64
+                mode: headless_ci
+                min_isolation: vm_isolated
+                automation:
+                  type: appium
+                  script_ref: s3://mobile-qa/tests/login-flow.zip
+                artifacts:
+                  screenshots: true
+                  video: true
+                  logcat: true
+                  junit: true
+                timeout_seconds: 900
+                state: queued
+                created_at: '2026-07-13T08:30:00Z'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+        '403':
+          $ref: '#/components/responses/ForbiddenError'
+        '404':
+          $ref: '#/components/responses/NotFoundError'
+        '409':
+          $ref: '#/components/responses/ConflictError'
+        '429':
+          $ref: '#/components/responses/QuotaExceededError'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/InfrastructureError'
+    get:
+      operationId: listJobs
+      summary: List jobs
+      description: Returns a cursor-paginated project job history, optionally filtered by state.
+      tags: [Jobs]
+      x-required-scopes: [project:read]
+      security:
+        - BearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/ProjectIdQuery'
+        - $ref: '#/components/parameters/JobStateQuery'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: Page of jobs.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/JobPage'
+              example:
+                items:
+                  - id: job_login_flow
+                    project_id: proj_mobile_qa
+                    runtime_profile: rtp_android_35_pixel_6_x86_64
+                    mode: headless_ci
+                    state: running_tests
+                    created_at: '2026-07-13T08:30:00Z'
+                    started_at: '2026-07-13T08:30:12Z'
+                next_cursor: job_login_flow
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+        '403':
+          $ref: '#/components/responses/ForbiddenError'
+        '404':
+          $ref: '#/components/responses/NotFoundError'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /v1/jobs/{job_id}:
+    get:
+      operationId: getJob
+      summary: Get a job
+      description: Returns current job state, result, and lifecycle timestamps.
+      tags: [Jobs]
+      x-required-scopes: [project:read]
+      security:
+        - BearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/JobId'
+      responses:
+        '200':
+          description: Job found.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Job'
+              example:
+                id: job_login_flow
+                project_id: proj_mobile_qa
+                apk_upload_id: upl_app_debug
+                runtime_profile: rtp_android_35_pixel_6_x86_64
+                mode: headless_ci
+                min_isolation: vm_isolated
+                automation:
+                  type: built_in_smoke
+                artifacts:
+                  screenshots: true
+                  video: false
+                  logcat: true
+                  junit: true
+                timeout_seconds: 900
+                state: passed
+                outcome: passed
+                worker_id: wrk_kvm_01
+                created_at: '2026-07-13T08:30:00Z'
+                started_at: '2026-07-13T08:30:12Z'
+                finished_at: '2026-07-13T08:33:48Z'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+        '403':
+          $ref: '#/components/responses/ForbiddenError'
+        '404':
+          $ref: '#/components/responses/NotFoundError'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /v1/jobs/{job_id}/events:
+    get:
+      operationId: streamJobEvents
+      summary: Stream job events
+      description: |
+        Streams ordered lifecycle events as Server-Sent Events. The SSE `id`
+        equals `JobEvent.sequence`, `event` equals `JobEvent.event_type`, and
+        `data` is the compact JSON serialization of the complete `JobEvent`.
+      tags: [Jobs]
+      x-required-scopes: [project:read]
+      x-event-schema: JobEvent
+      security:
+        - BearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/JobId'
+        - $ref: '#/components/parameters/LastEventId'
+      responses:
+        '200':
+          description: Ordered SSE stream; the server closes it after the terminal event.
+          content:
+            text/event-stream:
+              schema:
+                type: string
+              example: |-
+                id: 17
+                event: state_changed
+                data: {"id":"evt_running_tests","job_id":"job_login_flow","sequence":17,"timestamp":"2026-07-13T08:31:00Z","event_type":"state_changed","state":"running_tests","payload":{}}
+
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+        '403':
+          $ref: '#/components/responses/ForbiddenError'
+        '404':
+          $ref: '#/components/responses/NotFoundError'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /v1/jobs/{job_id}/artifacts:
+    get:
+      operationId: listJobArtifacts
+      summary: List job artifacts
+      description: Returns artifact metadata and short-lived download URLs when available.
+      tags: [Artifacts]
+      x-required-scopes: [project:read]
+      security:
+        - BearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/JobId'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: Page of artifacts.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ArtifactPage'
+              example:
+                items:
+                  - id: art_launch_screen
+                    job_id: job_login_flow
+                    kind: screenshot
+                    file_name: launch-screen.png
+                    size_bytes: 382110
+                    sha256: 3a7bd3e2360a3d80e1797c5c2b7961e57092b45f72f874b4fbd02b5e35d7a64c
+                    created_at: '2026-07-13T08:33:20Z'
+                    download_url: https://objects.example/artifacts/art_launch_screen?signature=example
+                    download_expires_at: '2026-07-13T08:48:20Z'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+        '403':
+          $ref: '#/components/responses/ForbiddenError'
+        '404':
+          $ref: '#/components/responses/NotFoundError'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/InfrastructureError'
+
+  /v1/jobs/{job_id}/debug-sessions:
+    post:
+      operationId: createDebugSession
+      summary: Create a debug session
+      description: Mints a short-lived, audience-bound browser debug token for one job.
+      tags: [Debug sessions]
+      x-required-scopes: [debug:create]
+      security:
+        - BearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/JobId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DebugSessionRequest'
+            example:
+              mode: controller
+      responses:
+        '201':
+          description: Debug session and token created.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DebugSessionToken'
+              example:
+                session_id: dbg_login_investigation
+                job_id: job_login_flow
+                mode: controller
+                token: eyJhbGciOiJFZERTQSJ9.example.signature
+                connect_url: https://debug.run-anywhere.example/sessions/dbg_login_investigation
+                expires_at: '2026-07-13T09:00:00Z'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+        '403':
+          $ref: '#/components/responses/ForbiddenError'
+        '404':
+          $ref: '#/components/responses/NotFoundError'
+        '409':
+          $ref: '#/components/responses/ConflictError'
+        '429':
+          $ref: '#/components/responses/QuotaExceededError'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/InfrastructureError'
+
+  /v1/jobs/{job_id}/cancel:
+    post:
+      operationId: cancelJob
+      summary: Cancel a job
+      description: Requests cancellation; the job still collects artifacts and cleans up before becoming terminal.
+      tags: [Jobs]
+      x-required-scopes: [project:write]
+      security:
+        - BearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/JobId'
+      responses:
+        '202':
+          description: Cancellation accepted.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Job'
+              example:
+                id: job_login_flow
+                project_id: proj_mobile_qa
+                apk_upload_id: upl_app_debug
+                runtime_profile: rtp_android_35_pixel_6_x86_64
+                mode: headless_ci
+                min_isolation: vm_isolated
+                automation:
+                  type: built_in_smoke
+                artifacts:
+                  screenshots: true
+                  video: false
+                  logcat: true
+                  junit: true
+                timeout_seconds: 900
+                state: collecting_artifacts
+                worker_id: wrk_kvm_01
+                created_at: '2026-07-13T08:30:00Z'
+                started_at: '2026-07-13T08:30:12Z'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+        '403':
+          $ref: '#/components/responses/ForbiddenError'
+        '404':
+          $ref: '#/components/responses/NotFoundError'
+        '409':
+          $ref: '#/components/responses/ConflictError'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /v1/webhooks:
+    post:
+      operationId: createWebhook
+      summary: Register a webhook
+      description: Registers a project callback for selected event classes.
+      tags: [Webhooks]
+      x-required-scopes: [project:write]
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateWebhookRequest'
+            example:
+              project_id: proj_mobile_qa
+              url: https://ci.example/hooks/run-anywhere
+              events: [job_state_changed]
+      responses:
+        '201':
+          description: Webhook registered.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Webhook'
+              example:
+                id: wh_ci_notifications
+                project_id: proj_mobile_qa
+                url: https://ci.example/hooks/run-anywhere
+                events: [job_state_changed]
+                active: true
+                created_at: '2026-07-13T08:30:00Z'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+        '403':
+          $ref: '#/components/responses/ForbiddenError'
+        '404':
+          $ref: '#/components/responses/NotFoundError'
+        '409':
+          $ref: '#/components/responses/ConflictError'
+        '429':
+          $ref: '#/components/responses/QuotaExceededError'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /v1/workers:
+    get:
+      operationId: listWorkers
+      summary: List workers
+      description: Returns worker capabilities, capacity, and liveness status.
+      tags: [Administration]
+      x-required-scopes: [admin]
+      security:
+        - BearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: Page of worker status records.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WorkerPage'
+              example:
+                items:
+                  - worker_id: wrk_kvm_01
+                    runtimes: [android_emulator_container, cuttlefish]
+                    kvm: true
+                    gpu: false
+                    arch: x86_64
+                    capacity: 8
+                    active_jobs: 3
+                    state: online
+                    last_seen: '2026-07-13T08:30:00Z'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+        '403':
+          $ref: '#/components/responses/ForbiddenError'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /v1/runtime-profiles:
+    get:
+      operationId: listRuntimeProfiles
+      summary: List runtime profiles
+      description: Returns configured Android version, device, architecture, runtime, and isolation combinations.
+      tags: [Administration]
+      x-required-scopes: [admin]
+      security:
+        - BearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: Page of runtime profiles.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RuntimeProfilePage'
+              example:
+                items:
+                  - id: rtp_android_35_pixel_6_x86_64
+                    android_api: 35
+                    device_profile: pixel_6
+                    abi: x86_64
+                    host_arch: x86_64
+                    runtime_kind: android_emulator_container
+                    image_ref: ghcr.io/example/android-emulator:35
+                    isolation_tier: vm_isolated
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+        '403':
+          $ref: '#/components/responses/ForbiddenError'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+components:
+  securitySchemes:
+    BearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: API key
+      description: Project-scoped API key, or the deployment bootstrap admin token for project creation.
+
+  parameters:
+    JobId:
+      name: job_id
+      in: path
+      required: true
+      description: Job identifier.
+      schema:
+        $ref: '#/components/schemas/JobId'
+    ProjectIdQuery:
+      name: project_id
+      in: query
+      required: true
+      description: Project whose jobs should be returned.
+      schema:
+        $ref: '#/components/schemas/ProjectId'
+    JobStateQuery:
+      name: status
+      in: query
+      required: false
+      description: Restrict results to a job state.
+      schema:
+        $ref: '#/components/schemas/JobState'
+    Cursor:
+      name: cursor
+      in: query
+      required: false
+      description: Opaque continuation cursor from the preceding page.
+      schema:
+        type: string
+        minLength: 1
+        maxLength: 2048
+    LastEventId:
+      name: Last-Event-ID
+      in: header
+      required: false
+      description: Resume after this SSE event sequence number.
+      schema:
+        type: integer
+        format: int64
+        minimum: 0
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      description: Opaque key used to deduplicate CI retries for this project.
+      schema:
+        type: string
+        minLength: 1
+        maxLength: 255
+        pattern: '^[\x21-\x7E]+$'
+      example: ci-8942-attempt-1
+
+  responses:
+    ValidationError:
+      description: The request is syntactically valid but fails validation.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            error:
+              code: validation
+              message: timeout_seconds must be positive
+              request_id: req_01j2x5h4g8z
+              details:
+                field: timeout_seconds
+    UnauthorizedError:
+      description: The bearer token is missing or invalid.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            error:
+              code: unauthorized
+              message: a valid bearer API key is required
+              request_id: req_01j2x5h4g8z
+    ForbiddenError:
+      description: The credential lacks the required scope or project access.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            error:
+              code: forbidden
+              message: project:write scope is required
+              request_id: req_01j2x5h4g8z
+    NotFoundError:
+      description: The requested resource does not exist or is not visible to the caller.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            error:
+              code: not_found
+              message: job was not found
+              request_id: req_01j2x5h4g8z
+    ConflictError:
+      description: The request conflicts with current resource state.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            error:
+              code: conflict
+              message: the job is already terminal
+              request_id: req_01j2x5h4g8z
+    QuotaExceededError:
+      description: The project has exceeded a configured quota.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            error:
+              code: quota_exceeded
+              message: concurrent job quota exceeded
+              request_id: req_01j2x5h4g8z
+    InfrastructureError:
+      description: Required infrastructure is temporarily unavailable.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            error:
+              code: infra_failed
+              message: object storage is unavailable
+              request_id: req_01j2x5h4g8z
+    InternalError:
+      description: An unexpected server error occurred.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            error:
+              code: internal_error
+              message: an unexpected error occurred
+              request_id: req_01j2x5h4g8z
+
+  schemas:
+    ProjectId:
+      type: string
+      pattern: '^proj_[A-Za-z0-9_-]+$'
+      example: proj_mobile_qa
+    UploadId:
+      type: string
+      pattern: '^upl_[A-Za-z0-9_-]+$'
+      example: upl_app_debug
+    RuntimeProfileId:
+      type: string
+      pattern: '^rtp_[A-Za-z0-9_-]+$'
+      example: rtp_android_35_pixel_6_x86_64
+    JobId:
+      type: string
+      pattern: '^job_[A-Za-z0-9_-]+$'
+      example: job_login_flow
+    JobEventId:
+      type: string
+      pattern: '^evt_[A-Za-z0-9_-]+$'
+      example: evt_running_tests
+    ArtifactId:
+      type: string
+      pattern: '^art_[A-Za-z0-9_-]+$'
+      example: art_launch_screen
+    WorkerId:
+      type: string
+      pattern: '^wrk_[A-Za-z0-9_-]+$'
+      example: wrk_kvm_01
+    DebugSessionId:
+      type: string
+      pattern: '^dbg_[A-Za-z0-9_-]+$'
+      example: dbg_login_investigation
+    WebhookId:
+      type: string
+      pattern: '^wh_[A-Za-z0-9_-]+$'
+      example: wh_ci_notifications
+    LeaseId:
+      type: string
+      pattern: '^lease_[A-Za-z0-9_-]+$'
+      example: lease_login_flow_01
+    RequestId:
+      type: string
+      pattern: '^req_[A-Za-z0-9_-]+$'
+      example: req_01j2x5h4g8z
+    Sha256:
+      type: string
+      pattern: '^[0-9a-f]{64}$'
+      example: 3a7bd3e2360a3d80e1797c5c2b7961e57092b45f72f874b4fbd02b5e35d7a64c
+    Uri:
+      type: string
+      format: uri
+      minLength: 1
+      example: https://objects.example/resource
+    ScriptRef:
+      type: string
+      minLength: 1
+      example: s3://mobile-qa/tests/login-flow.zip
+    DurationSeconds:
+      type: integer
+      format: int64
+      minimum: 1
+      example: 900
+
+    AuthScope:
+      type: string
+      enum: [project:read, project:write, debug:create, admin]
+    UploadKind:
+      type: string
+      enum: [apk, test, script]
+    RuntimeKind:
+      type: string
+      enum:
+        - android_emulator_container
+        - redroid
+        - cuttlefish
+        - browser_native_wasm
+      description: browser_native_wasm is reserved and rejected by Part 01 runtime-profile validation.
+    IsolationTier:
+      type: string
+      enum: [vm_isolated, shared_kernel_privileged]
+      description: vm_isolated satisfies either minimum; shared_kernel_privileged satisfies only itself.
+    HostArch:
+      type: string
+      enum: [x86_64, aarch64]
+    AndroidAbi:
+      type: string
+      enum: [x86, x86_64, armeabi_v7a, arm64_v8a]
+    JobMode:
+      type: string
+      enum: [headless_ci, browser_debug]
+    JobState:
+      type: string
+      enum:
+        - queued
+        - claimed
+        - provisioning_runtime
+        - booting
+        - installing_apk
+        - running_tests
+        - debug_available
+        - collecting_artifacts
+        - cleaning_up
+        - passed
+        - failed
+        - cancelled
+        - timed_out
+        - infra_failed
+    JobOutcome:
+      type: string
+      enum: [passed, failed, cancelled, timed_out, infra_failed]
+    TransitionEvidence:
+      type: object
+      required: [artifacts_finalized, cleanup_completed]
+      properties:
+        pending_outcome:
+          $ref: '#/components/schemas/JobOutcome'
+        artifacts_finalized:
+          type: boolean
+        cleanup_completed:
+          type: boolean
+    ArtifactKind:
+      type: string
+      enum:
+        - apk_metadata
+        - install_log
+        - logcat
+        - screenshot
+        - video
+        - appium_log
+        - junit
+        - crash_trace
+        - runtime_metrics
+        - debug_session_audit
+    WorkerState:
+      type: string
+      enum: [online, draining, offline]
+    DebugSessionMode:
+      type: string
+      enum: [viewer, controller]
+    WebhookEvent:
+      type: string
+      enum: [job_state_changed]
+    ErrorCode:
+      type: string
+      enum:
+        - validation
+        - unauthorized
+        - forbidden
+        - not_found
+        - conflict
+        - quota_exceeded
+        - infra_failed
+        - internal_error
+
+    CreateProjectRequest:
+      type: object
+      required: [name]
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 255
+    Project:
+      type: object
+      required: [id, name, owner, created_at]
+      properties:
+        id:
+          $ref: '#/components/schemas/ProjectId'
+        name:
+          type: string
+        owner:
+          type: string
+        created_at:
+          type: string
+          format: date-time
+    CreateProjectResponse:
+      type: object
+      required: [project, api_key, scopes]
+      properties:
+        project:
+          $ref: '#/components/schemas/Project'
+        api_key:
+          type: string
+          minLength: 1
+          description: Plaintext API key returned once at project creation.
+        scopes:
+          type: array
+          uniqueItems: true
+          items:
+            $ref: '#/components/schemas/AuthScope'
+
+    CreateUploadRequest:
+      type: object
+      required: [project_id, kind, file_name, content_type, size_bytes, sha256]
+      properties:
+        project_id:
+          $ref: '#/components/schemas/ProjectId'
+        kind:
+          $ref: '#/components/schemas/UploadKind'
+        file_name:
+          type: string
+          minLength: 1
+        content_type:
+          type: string
+          minLength: 1
+        size_bytes:
+          type: integer
+          format: int64
+          minimum: 0
+        sha256:
+          $ref: '#/components/schemas/Sha256'
+    CreateUploadResponse:
+      type: object
+      required: [upload_id, upload_url, required_headers, expires_at]
+      properties:
+        upload_id:
+          $ref: '#/components/schemas/UploadId'
+        upload_url:
+          $ref: '#/components/schemas/Uri'
+        required_headers:
+          type: object
+          additionalProperties:
+            type: string
+        expires_at:
+          type: string
+          format: date-time
+
+    RuntimeProfile:
+      type: object
+      required:
+        - id
+        - android_api
+        - device_profile
+        - abi
+        - host_arch
+        - runtime_kind
+        - image_ref
+        - isolation_tier
+      properties:
+        id:
+          $ref: '#/components/schemas/RuntimeProfileId'
+        android_api:
+          type: integer
+          format: int32
+          minimum: 0
+        device_profile:
+          type: string
+          minLength: 1
+        abi:
+          $ref: '#/components/schemas/AndroidAbi'
+        host_arch:
+          $ref: '#/components/schemas/HostArch'
+        runtime_kind:
+          $ref: '#/components/schemas/RuntimeKind'
+        image_ref:
+          type: string
+          minLength: 1
+        isolation_tier:
+          $ref: '#/components/schemas/IsolationTier'
+
+    BuiltInSmokeAutomation:
+      type: object
+      required: [type]
+      properties:
+        type:
+          type: string
+          const: built_in_smoke
+    AppiumAutomation:
+      type: object
+      required: [type, script_ref]
+      properties:
+        type:
+          type: string
+          const: appium
+        script_ref:
+          $ref: '#/components/schemas/ScriptRef'
+    AutomationSpec:
+      oneOf:
+        - $ref: '#/components/schemas/BuiltInSmokeAutomation'
+        - $ref: '#/components/schemas/AppiumAutomation'
+      discriminator:
+        propertyName: type
+        mapping:
+          built_in_smoke: '#/components/schemas/BuiltInSmokeAutomation'
+          appium: '#/components/schemas/AppiumAutomation'
+      default:
+        type: built_in_smoke
+    ArtifactSelection:
+      type: object
+      required: [screenshots, video, logcat, junit]
+      properties:
+        screenshots:
+          type: boolean
+        video:
+          type: boolean
+        logcat:
+          type: boolean
+        junit:
+          type: boolean
+    CreateJobRequest:
+      type: object
+      required:
+        - project_id
+        - apk_upload_id
+        - runtime_profile
+        - mode
+        - min_isolation
+        - artifacts
+        - timeout_seconds
+      properties:
+        project_id:
+          $ref: '#/components/schemas/ProjectId'
+        apk_upload_id:
+          $ref: '#/components/schemas/UploadId'
+        test_upload_id:
+          oneOf:
+            - $ref: '#/components/schemas/UploadId'
+        runtime_profile:
+          $ref: '#/components/schemas/RuntimeProfileId'
+        mode:
+          $ref: '#/components/schemas/JobMode'
+        min_isolation:
+          $ref: '#/components/schemas/IsolationTier'
+        automation:
+          $ref: '#/components/schemas/AutomationSpec'
+        artifacts:
+          $ref: '#/components/schemas/ArtifactSelection'
+        timeout_seconds:
+          $ref: '#/components/schemas/DurationSeconds'
+    FailureDetail:
+      type: object
+      required: [code, message]
+      properties:
+        code:
+          $ref: '#/components/schemas/ErrorCode'
+        message:
+          type: string
+          minLength: 1
+    Job:
+      type: object
+      required:
+        - id
+        - project_id
+        - apk_upload_id
+        - runtime_profile
+        - mode
+        - min_isolation
+        - automation
+        - artifacts
+        - timeout_seconds
+        - state
+        - created_at
+      properties:
+        id:
+          $ref: '#/components/schemas/JobId'
+        project_id:
+          $ref: '#/components/schemas/ProjectId'
+        apk_upload_id:
+          $ref: '#/components/schemas/UploadId'
+        test_upload_id:
+          $ref: '#/components/schemas/UploadId'
+        runtime_profile:
+          $ref: '#/components/schemas/RuntimeProfileId'
+        mode:
+          $ref: '#/components/schemas/JobMode'
+        min_isolation:
+          $ref: '#/components/schemas/IsolationTier'
+        automation:
+          $ref: '#/components/schemas/AutomationSpec'
+        artifacts:
+          $ref: '#/components/schemas/ArtifactSelection'
+        timeout_seconds:
+          $ref: '#/components/schemas/DurationSeconds'
+        state:
+          $ref: '#/components/schemas/JobState'
+        outcome:
+          $ref: '#/components/schemas/JobOutcome'
+        failure:
+          $ref: '#/components/schemas/FailureDetail'
+        worker_id:
+          $ref: '#/components/schemas/WorkerId'
+        created_at:
+          type: string
+          format: date-time
+        started_at:
+          type: [string, 'null']
+          format: date-time
+        finished_at:
+          type: [string, 'null']
+          format: date-time
+    JobSummary:
+      type: object
+      required: [id, project_id, runtime_profile, mode, state, created_at]
+      properties:
+        id:
+          $ref: '#/components/schemas/JobId'
+        project_id:
+          $ref: '#/components/schemas/ProjectId'
+        runtime_profile:
+          $ref: '#/components/schemas/RuntimeProfileId'
+        mode:
+          $ref: '#/components/schemas/JobMode'
+        state:
+          $ref: '#/components/schemas/JobState'
+        outcome:
+          $ref: '#/components/schemas/JobOutcome'
+        created_at:
+          type: string
+          format: date-time
+        started_at:
+          type: [string, 'null']
+          format: date-time
+        finished_at:
+          type: [string, 'null']
+          format: date-time
+    JobEvent:
+      type: object
+      required: [id, job_id, sequence, timestamp, event_type, payload]
+      properties:
+        id:
+          $ref: '#/components/schemas/JobEventId'
+        job_id:
+          $ref: '#/components/schemas/JobId'
+        sequence:
+          type: integer
+          format: int64
+          minimum: 0
+        timestamp:
+          type: string
+          format: date-time
+        event_type:
+          type: string
+          minLength: 1
+        state:
+          $ref: '#/components/schemas/JobState'
+        payload:
+          type: object
+          additionalProperties: true
+
+    Artifact:
+      type: object
+      required: [id, job_id, kind, size_bytes, sha256, created_at]
+      properties:
+        id:
+          $ref: '#/components/schemas/ArtifactId'
+        job_id:
+          $ref: '#/components/schemas/JobId'
+        kind:
+          $ref: '#/components/schemas/ArtifactKind'
+        file_name:
+          type: string
+          minLength: 1
+        size_bytes:
+          type: integer
+          format: int64
+          minimum: 0
+        sha256:
+          $ref: '#/components/schemas/Sha256'
+        created_at:
+          type: string
+          format: date-time
+        download_url:
+          $ref: '#/components/schemas/Uri'
+        download_expires_at:
+          type: [string, 'null']
+          format: date-time
+
+    WorkerStatus:
+      type: object
+      required: [worker_id, runtimes, kvm, gpu, arch, capacity, active_jobs, state, last_seen]
+      properties:
+        worker_id:
+          $ref: '#/components/schemas/WorkerId'
+        runtimes:
+          type: array
+          uniqueItems: true
+          items:
+            $ref: '#/components/schemas/RuntimeKind'
+        kvm:
+          type: boolean
+        gpu:
+          type: boolean
+        arch:
+          $ref: '#/components/schemas/HostArch'
+        capacity:
+          type: integer
+          format: int32
+          minimum: 0
+        active_jobs:
+          type: integer
+          format: int32
+          minimum: 0
+        state:
+          $ref: '#/components/schemas/WorkerState'
+        last_seen:
+          type: string
+          format: date-time
+
+    DebugSessionRequest:
+      type: object
+      required: [mode]
+      properties:
+        mode:
+          $ref: '#/components/schemas/DebugSessionMode'
+    DebugSessionToken:
+      type: object
+      required: [session_id, job_id, mode, token, connect_url, expires_at]
+      properties:
+        session_id:
+          $ref: '#/components/schemas/DebugSessionId'
+        job_id:
+          $ref: '#/components/schemas/JobId'
+        mode:
+          $ref: '#/components/schemas/DebugSessionMode'
+        token:
+          type: string
+          minLength: 1
+        connect_url:
+          $ref: '#/components/schemas/Uri'
+        expires_at:
+          type: string
+          format: date-time
+
+    CreateWebhookRequest:
+      type: object
+      required: [project_id, url, events]
+      properties:
+        project_id:
+          $ref: '#/components/schemas/ProjectId'
+        url:
+          $ref: '#/components/schemas/Uri'
+        events:
+          type: array
+          minItems: 1
+          uniqueItems: true
+          items:
+            $ref: '#/components/schemas/WebhookEvent'
+    Webhook:
+      type: object
+      required: [id, project_id, url, events, active, created_at]
+      properties:
+        id:
+          $ref: '#/components/schemas/WebhookId'
+        project_id:
+          $ref: '#/components/schemas/ProjectId'
+        url:
+          $ref: '#/components/schemas/Uri'
+        events:
+          type: array
+          minItems: 1
+          uniqueItems: true
+          items:
+            $ref: '#/components/schemas/WebhookEvent'
+        active:
+          type: boolean
+        created_at:
+          type: string
+          format: date-time
+
+    JobPage:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/JobSummary'
+        next_cursor:
+          type: string
+          minLength: 1
+    ArtifactPage:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/Artifact'
+        next_cursor:
+          type: string
+          minLength: 1
+    WorkerPage:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/WorkerStatus'
+        next_cursor:
+          type: string
+          minLength: 1
+    RuntimeProfilePage:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/RuntimeProfile'
+        next_cursor:
+          type: string
+          minLength: 1
+
+    ApiError:
+      type: object
+      required: [code, message, request_id]
+      properties:
+        code:
+          $ref: '#/components/schemas/ErrorCode'
+        message:
+          type: string
+          minLength: 1
+        request_id:
+          $ref: '#/components/schemas/RequestId'
+        details:
+          type: object
+          additionalProperties: true
+    ErrorResponse:
+      type: object
+      required: [error]
+      properties:
+        error:
+          $ref: '#/components/schemas/ApiError'
+
+    WorkerRegistration:
+      type: object
+      required: [worker_id, runtimes, kvm, gpu, arch, capacity]
+      properties:
+        worker_id:
+          $ref: '#/components/schemas/WorkerId'
+        runtimes:
+          type: array
+          uniqueItems: true
+          items:
+            $ref: '#/components/schemas/RuntimeKind'
+        kvm:
+          type: boolean
+        gpu:
+          type: boolean
+        arch:
+          $ref: '#/components/schemas/HostArch'
+        capacity:
+          type: integer
+          format: int32
+          minimum: 0
+    WorkerHeartbeat:
+      type: object
+      required:
+        - worker_id
+        - active_jobs
+        - capacity
+        - runtimes
+        - kvm
+        - gpu
+        - arch
+        - lease_extends
+        - last_seen
+      properties:
+        worker_id:
+          $ref: '#/components/schemas/WorkerId'
+        active_jobs:
+          type: integer
+          format: int32
+          minimum: 0
+        capacity:
+          type: integer
+          format: int32
+          minimum: 0
+        runtimes:
+          type: array
+          uniqueItems: true
+          items:
+            $ref: '#/components/schemas/RuntimeKind'
+        kvm:
+          type: boolean
+        gpu:
+          type: boolean
+        arch:
+          $ref: '#/components/schemas/HostArch'
+        lease_extends:
+          type: array
+          items:
+            $ref: '#/components/schemas/JobLeaseExtension'
+        last_seen:
+          type: string
+          format: date-time
+    JobQueued:
+      type: object
+      required: [job_id, project_id, runtime_profile, min_isolation, timeout_seconds]
+      properties:
+        job_id:
+          $ref: '#/components/schemas/JobId'
+        project_id:
+          $ref: '#/components/schemas/ProjectId'
+        runtime_profile:
+          $ref: '#/components/schemas/RuntimeProfile'
+        min_isolation:
+          $ref: '#/components/schemas/IsolationTier'
+        timeout_seconds:
+          $ref: '#/components/schemas/DurationSeconds'
+    JobClaim:
+      type: object
+      required:
+        - job_id
+        - project_id
+        - worker_id
+        - lease_id
+        - apk_upload_id
+        - runtime_profile
+        - mode
+        - min_isolation
+        - automation
+        - artifacts
+        - timeout_seconds
+        - claimed_at
+        - lease_expires_at
+      properties:
+        job_id:
+          $ref: '#/components/schemas/JobId'
+        project_id:
+          $ref: '#/components/schemas/ProjectId'
+        worker_id:
+          $ref: '#/components/schemas/WorkerId'
+        lease_id:
+          $ref: '#/components/schemas/LeaseId'
+        apk_upload_id:
+          $ref: '#/components/schemas/UploadId'
+        test_upload_id:
+          $ref: '#/components/schemas/UploadId'
+        runtime_profile:
+          $ref: '#/components/schemas/RuntimeProfile'
+        mode:
+          $ref: '#/components/schemas/JobMode'
+        min_isolation:
+          $ref: '#/components/schemas/IsolationTier'
+        automation:
+          $ref: '#/components/schemas/AutomationSpec'
+        artifacts:
+          $ref: '#/components/schemas/ArtifactSelection'
+        timeout_seconds:
+          $ref: '#/components/schemas/DurationSeconds'
+        claimed_at:
+          type: string
+          format: date-time
+        lease_expires_at:
+          type: string
+          format: date-time
+    JobLeaseExtension:
+      type: object
+      required: [job_id, lease_id]
+      properties:
+        job_id:
+          $ref: '#/components/schemas/JobId'
+        lease_id:
+          $ref: '#/components/schemas/LeaseId'
+    JobResult:
+      type: object
+      required:
+        - job_id
+        - worker_id
+        - lease_id
+        - outcome
+        - artifact_ids
+        - artifacts_finalized
+        - cleanup_completed
+        - completed_at
+      properties:
+        job_id:
+          $ref: '#/components/schemas/JobId'
+        worker_id:
+          $ref: '#/components/schemas/WorkerId'
+        lease_id:
+          $ref: '#/components/schemas/LeaseId'
+        outcome:
+          $ref: '#/components/schemas/JobOutcome'
+        artifact_ids:
+          type: array
+          uniqueItems: true
+          items:
+            $ref: '#/components/schemas/ArtifactId'
+        artifacts_finalized:
+          type: boolean
+        cleanup_completed:
+          type: boolean
+        error:
+          $ref: '#/components/schemas/FailureDetail'
+        completed_at:
+          type: string
+          format: date-time

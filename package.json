@@ -1,0 +1,16 @@
+{
+  "name": "run-anywhere-workspace",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Developer tooling for the Run Anywhere monorepo",
+  "scripts": {
+    "openapi:lint": "redocly lint openapi/v1.yaml"
+  },
+  "devDependencies": {
+    "@redocly/cli": "2.38.0"
+  },
+  "engines": {
+    "node": ">=22.12.0",
+    "npm": ">=10.9.2"
+  }
+}
