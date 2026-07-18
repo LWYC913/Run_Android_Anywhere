@@ -1,0 +1,25 @@
+[workspace]
+members = [
+    "crates/contracts",
+    "crates/api",
+    "crates/scheduler",
+    "crates/worker",
+]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85.0"
+license = "MIT"
+repository = "https://github.com/LWYC913/Run_Android_Anywhere"
+
+[workspace.dependencies]
+run-anywhere-contracts = { version = "0.1.0", path = "crates/contracts" }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+
