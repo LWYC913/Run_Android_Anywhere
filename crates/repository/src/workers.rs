@@ -2,12 +2,15 @@ use std::collections::HashSet;
 
 use chrono::{DateTime, Duration, Utc};
 use run_anywhere_contracts::{
-    HostArch, IsolationTier, RuntimeProfile, WorkerHeartbeat, WorkerId, WorkerRegistration,
-    WorkerState, WorkerStatus,
+    HostArch, IsolationTier, RuntimeProfile, WorkerHeartbeat, WorkerId, WorkerPage,
+    WorkerRegistration, WorkerState, WorkerStatus,
 };
+use sqlx::{Postgres, QueryBuilder};
 
 use crate::{
-    HeartbeatReceipt, Repository, RepositoryError, RepositoryResult, codec::encode_enum,
+    HeartbeatReceipt, Repository, RepositoryError, RepositoryResult, WorkerCursor,
+    codec::encode_enum,
+    models::{CONTROL_PLANE_PAGE_SIZE, decode_route_cursor, encode_route_cursor},
     rows::WorkerRow,
 };
 
@@ -177,6 +180,55 @@ impl Repository {
         .into_iter()
         .map(WorkerRow::into_status)
         .collect()
+    }
+
+    pub async fn list_workers_page(&self, cursor: Option<&str>) -> RepositoryResult<WorkerPage> {
+        let cursor = cursor
+            .map(|value| decode_route_cursor::<WorkerCursor>("workers", value))
+            .transpose()?;
+        let mut builder = QueryBuilder::<Postgres>::new(
+            "SELECT id, runtimes, kvm, gpu, arch, capacity, active_jobs, state, \
+             last_heartbeat_at, reported_last_seen_at, registered_at, updated_at \
+             FROM workers",
+        );
+        if let Some(cursor) = cursor {
+            builder.push(" WHERE (registered_at, id) > (");
+            builder.push_bind(cursor.registered_at);
+            builder.push(", ");
+            builder.push_bind(cursor.worker_id);
+            builder.push(")");
+        }
+        builder.push(" ORDER BY registered_at, id LIMIT ");
+        builder.push_bind(CONTROL_PLANE_PAGE_SIZE + 1);
+        let mut rows = builder
+            .build_query_as::<WorkerRow>()
+            .fetch_all(&self.pool)
+            .await?;
+        let has_more =
+            rows.len() > usize::try_from(CONTROL_PLANE_PAGE_SIZE).expect("page size is positive");
+        if has_more {
+            rows.pop();
+        }
+        let next_cursor = if has_more {
+            rows.last()
+                .map(|row| {
+                    encode_route_cursor(
+                        "workers",
+                        WorkerCursor {
+                            registered_at: row.registered_at,
+                            worker_id: row.id.clone(),
+                        },
+                    )
+                })
+                .transpose()?
+        } else {
+            None
+        };
+        let items = rows
+            .into_iter()
+            .map(WorkerRow::into_status)
+            .collect::<RepositoryResult<_>>()?;
+        Ok(WorkerPage { items, next_cursor })
     }
 
     pub async fn find_workers_matching(

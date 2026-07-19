@@ -139,6 +139,8 @@ const PRIMITIVE_SCHEMAS: &[&str] = &[
     "DurationSeconds",
 ];
 
+const UNION_SCHEMAS: &[&str] = &["AutomationSpec"];
+
 fn repository_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
 }
@@ -252,6 +254,48 @@ fn property_shape(value: &Value) -> Value {
     serde_json::to_value(shape).expect("shape must serialize")
 }
 
+fn tagged_union_shape(schema: &Value, components: &Map<String, Value>) -> Vec<Value> {
+    let schema = ref_name(schema)
+        .and_then(|name| components.get(name))
+        .unwrap_or(schema);
+    let variants = schema
+        .get("oneOf")
+        .or_else(|| schema.get("anyOf"))
+        .and_then(Value::as_array)
+        .expect("tagged union must contain oneOf or anyOf");
+    let mut shapes = variants
+        .iter()
+        .map(|variant| {
+            let variant = ref_name(variant)
+                .and_then(|name| components.get(name))
+                .unwrap_or(variant);
+            let properties = variant
+                .get("properties")
+                .and_then(Value::as_object)
+                .expect("tagged-union variants must be objects");
+            let properties = properties
+                .iter()
+                .map(|(name, property)| {
+                    let shape = if let Some(value) = property.get("const") {
+                        json!({ "literals": [value] })
+                    } else if let Some(values) = property.get("enum") {
+                        json!({ "literals": values })
+                    } else {
+                        property_shape(property)
+                    };
+                    (name.clone(), shape)
+                })
+                .collect::<BTreeMap<_, _>>();
+            json!({
+                "required": string_set(variant.get("required")),
+                "properties": properties,
+            })
+        })
+        .collect::<Vec<_>>();
+    shapes.sort_by_key(Value::to_string);
+    shapes
+}
+
 #[test]
 fn rust_and_openapi_component_structures_match() {
     let spec = openapi_document();
@@ -323,6 +367,20 @@ fn rust_and_openapi_component_structures_match() {
             property_shape(rust),
             property_shape(openapi),
             "primitive drift in {name}"
+        );
+    }
+
+    for name in UNION_SCHEMAS {
+        let rust = generated
+            .get(*name)
+            .unwrap_or_else(|| panic!("Rust union {name} is missing"));
+        let openapi = documented
+            .get(*name)
+            .unwrap_or_else(|| panic!("OpenAPI union {name} is missing"));
+        assert_eq!(
+            tagged_union_shape(rust, generated),
+            tagged_union_shape(openapi, documented),
+            "tagged-union drift in {name}"
         );
     }
 
@@ -628,7 +686,7 @@ fn operation_scopes_bodies_responses_and_examples_are_exact() {
             .get("responses")
             .and_then(Value::as_object)
             .expect("responses must be an object");
-        for status in ["401", "403", "500"] {
+        for status in ["401", "403", "500", "503"] {
             assert!(
                 responses.contains_key(status),
                 "standard {status} response missing in {} {}",
@@ -637,4 +695,13 @@ fn operation_scopes_bodies_responses_and_examples_are_exact() {
             );
         }
     }
+
+    assert_eq!(
+        spec.pointer(
+            "/paths/~1v1~1uploads~1apk/post/responses/201/content/application~1json/example/required_headers/x-amz-checksum-sha256"
+        )
+        .and_then(Value::as_str),
+        Some("OnvT4jYKPYDheXxcK3lh5XCStF9y+HS0+9ArXjXXpkw="),
+        "signed upload examples must require the SHA-256 checksum header"
+    );
 }

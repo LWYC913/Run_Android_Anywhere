@@ -4,8 +4,8 @@ use chrono::{Duration, Utc};
 use run_anywhere_contracts::{
     AndroidAbi, ArtifactKind, ArtifactSelection, AuthScope, AutomationSpec, CreateJobRequest,
     CreateWebhookRequest, DebugSessionMode, DurationSeconds, ErrorCode, HostArch, IsolationTier,
-    JobLeaseExtension, JobMode, JobOutcome, JobResult, JobState, JobSummary, LeaseId, ProjectId,
-    RuntimeKind, RuntimeProfile, RuntimeProfileId, Sha256, TransitionEvidence, UploadId,
+    JobLeaseExtension, JobMode, JobOutcome, JobQueued, JobResult, JobState, JobSummary, LeaseId,
+    ProjectId, RuntimeKind, RuntimeProfile, RuntimeProfileId, Sha256, TransitionEvidence, UploadId,
     UploadKind, Uri, WebhookEvent, WorkerHeartbeat, WorkerId, WorkerRegistration, WorkerState,
 };
 use run_anywhere_repository::{
@@ -122,6 +122,9 @@ async fn migrations_are_reversible_and_seed_exact_profiles(pool: PgPool) -> Test
     let repository = Repository::new(pool.clone());
     let profiles = repository.list_runtime_profiles().await?;
     assert_eq!(profiles.len(), 4);
+    let profile_page = repository.list_runtime_profiles_page(None).await?;
+    assert_eq!(profile_page.items.len(), 4);
+    assert!(profile_page.next_cursor.is_none());
 
     let profile_ids = profiles
         .iter()
@@ -186,6 +189,7 @@ async fn concurrent_job_creation_is_idempotent(pool: PgPool) -> TestResult {
 
     assert_eq!(left.job.id, right.job.id);
     assert_ne!(left.was_created, right.was_created);
+    assert_ne!(left.queued_event.is_some(), right.queued_event.is_some());
     let event_count = fixture
         .repository
         .list_job_events_after(&left.job.id, 0, 10)
@@ -196,6 +200,22 @@ async fn concurrent_job_creation_is_idempotent(pool: PgPool) -> TestResult {
         .fetch_one(&pool)
         .await?;
     assert_eq!(persisted_jobs, 1);
+    let outbox_count: i64 = sqlx::query_scalar("SELECT count(*) FROM outbox_messages")
+        .fetch_one(&pool)
+        .await?;
+    assert_eq!(
+        outbox_count, 1,
+        "only the winning insert emits an outbox row"
+    );
+    let queued: JobQueued = serde_json::from_value(
+        fixture
+            .repository
+            .get_outbox_message(left.job.id.as_str())
+            .await?
+            .expect("winning job has an outbox message")
+            .payload,
+    )?;
+    assert_eq!(queued.job_id, left.job.id);
 
     let mut changed_retry = fixture.request();
     changed_retry.apk_upload_id = UploadId::new("upl_missing_retry_body")?;
@@ -204,7 +224,162 @@ async fn concurrent_job_creation_is_idempotent(pool: PgPool) -> TestResult {
         .create_job(changed_retry, "same-request")
         .await?;
     assert!(!retry.was_created);
+    assert!(retry.queued_event.is_none());
     assert_eq!(retry.job.id, left.job.id);
+    Ok(())
+}
+
+#[sqlx::test(migrator = "run_anywhere_repository::MIGRATOR")]
+async fn project_initial_key_is_atomic_and_outbox_leases_are_recoverable(
+    pool: PgPool,
+) -> TestResult {
+    let repository = Repository::new(pool.clone());
+    assert!(matches!(
+        repository
+            .create_project_with_api_key("invalid", "owner", Vec::new())
+            .await,
+        Err(RepositoryError::Validation(_))
+    ));
+    let project_count: i64 = sqlx::query_scalar("SELECT count(*) FROM projects")
+        .fetch_one(&pool)
+        .await?;
+    assert_eq!(project_count, 0);
+
+    let created = repository
+        .create_project_with_api_key(
+            "control plane",
+            "bootstrap-admin",
+            vec![
+                AuthScope::ProjectRead,
+                AuthScope::ProjectWrite,
+                AuthScope::DebugCreate,
+            ],
+        )
+        .await?;
+    assert_eq!(created.project.id, created.api_key.record.project_id);
+    let found_key = repository
+        .find_api_key_by_hash(Repository::hash_api_key(
+            created.api_key.key.expose_secret(),
+        ))
+        .await?
+        .expect("initial key committed with project");
+    assert_eq!(found_key.id, created.api_key.record.id);
+
+    let upload = repository
+        .create_upload(
+            &created.project.id,
+            UploadKind::Apk,
+            "projects/control-plane/app.apk",
+            digest('e'),
+            100,
+        )
+        .await?;
+    let profile = repository
+        .get_runtime_profile(&RuntimeProfileId::new(EMULATOR_PROFILE)?)
+        .await?
+        .expect("seeded profile");
+    let request = CreateJobRequest {
+        project_id: created.project.id,
+        apk_upload_id: upload.id,
+        test_upload_id: None,
+        runtime_profile: profile.id,
+        mode: JobMode::HeadlessCi,
+        min_isolation: IsolationTier::VmIsolated,
+        automation: AutomationSpec::BuiltInSmoke,
+        artifacts: ArtifactSelection {
+            screenshots: false,
+            video: false,
+            logcat: true,
+            junit: true,
+        },
+        timeout_seconds: DurationSeconds::new(120)?,
+    };
+    let created_job = repository
+        .create_job_with_outbox(
+            request,
+            "outbox-flow",
+            BTreeMap::from([("traceparent".to_owned(), "00-test-trace".to_owned())]),
+        )
+        .await?;
+    assert_eq!(repository.pending_outbox_count().await?, 1);
+    let persisted = repository
+        .find_job_by_idempotency_key(&created_job.job.project_id, "outbox-flow")
+        .await?
+        .expect("idempotency lookup finds job");
+    assert_eq!(persisted.id, created_job.job.id);
+
+    let first_lease = repository
+        .lease_outbox_messages("dispatcher-a", Duration::seconds(30), 10)
+        .await?;
+    assert_eq!(first_lease.len(), 1);
+    assert_eq!(first_lease[0].event_key, created_job.job.id.as_str());
+    assert_eq!(first_lease[0].subject, "jobs.queued");
+    assert_eq!(first_lease[0].attempts, 1);
+    assert_eq!(
+        first_lease[0].trace_headers.get("traceparent"),
+        Some(&"00-test-trace".to_owned())
+    );
+    assert!(
+        repository
+            .lease_outbox_messages("dispatcher-b", Duration::seconds(30), 10)
+            .await?
+            .is_empty()
+    );
+    repository
+        .retry_outbox_message(
+            first_lease[0].id,
+            "dispatcher-a",
+            Utc::now() - Duration::seconds(1),
+            "temporary NATS failure",
+        )
+        .await?;
+    let second_lease = repository
+        .lease_outbox_messages("dispatcher-b", Duration::seconds(30), 10)
+        .await?;
+    assert_eq!(second_lease.len(), 1);
+    assert_eq!(second_lease[0].attempts, 2);
+    let published = repository
+        .mark_outbox_published(second_lease[0].id, "dispatcher-b")
+        .await?;
+    assert!(published.published_at.is_some());
+    assert!(published.locked_by.is_none());
+    assert_eq!(repository.pending_outbox_count().await?, 0);
+    Ok(())
+}
+
+#[sqlx::test(migrator = "run_anywhere_repository::MIGRATOR")]
+async fn cancellation_request_is_guarded_eventful_and_idempotent(pool: PgPool) -> TestResult {
+    let fixture = Fixture::new(&pool).await?;
+    let job = fixture.create_job("cancel-flow").await?.job;
+    let first = fixture.repository.request_job_cancellation(&job.id).await?;
+    assert!(first.was_changed);
+    assert_eq!(first.job.state, JobState::CollectingArtifacts);
+    assert_eq!(
+        first.event.as_ref().map(|event| event.event_type.as_str()),
+        Some("job.cancellation_requested")
+    );
+
+    let replay = fixture.repository.request_job_cancellation(&job.id).await?;
+    assert!(!replay.was_changed);
+    assert!(replay.event.is_none());
+    let events = fixture
+        .repository
+        .list_job_events_after(&job.id, 0, 10)
+        .await?;
+    assert_eq!(events.len(), 2, "a cancel replay must not append an event");
+
+    sqlx::query(
+        "UPDATE jobs SET state = 'cancelled', outcome = 'cancelled', \
+         artifacts_finalized = TRUE, cleanup_completed = TRUE, finished_at = now() \
+         WHERE id = $1",
+    )
+    .bind(job.id.as_str())
+    .execute(&pool)
+    .await?;
+    assert!(matches!(
+        fixture.repository.request_job_cancellation(&job.id).await,
+        Err(RepositoryError::Conflict(_))
+    ));
     Ok(())
 }
 
@@ -881,6 +1056,9 @@ async fn matcher_excludes_every_ineligible_worker(pool: PgPool) -> TestResult {
             .is_empty(),
         "shared-kernel profile cannot satisfy a VM-isolated job"
     );
+    let worker_page = fixture.repository.list_workers_page(None).await?;
+    assert_eq!(worker_page.items.len(), 7);
+    assert!(worker_page.next_cursor.is_none());
     Ok(())
 }
 
@@ -924,7 +1102,6 @@ async fn events_are_ordered_cursor_readable_and_append_only(pool: PgPool) -> Tes
         .list_job_events_after(&job.id, events[0].sequence, 10)
         .await?;
     assert_eq!(after_first, events[1..]);
-
     let mutation_error = sqlx::query("UPDATE job_events SET event_type = 'tampered' WHERE id = $1")
         .bind(events[0].id.as_str())
         .execute(&pool)
@@ -1014,6 +1191,12 @@ async fn artifact_debug_webhook_and_audit_guards_hold(pool: PgPool) -> TestResul
         .await?;
     assert_eq!(first_artifact, repeated_artifact);
     assert_eq!(fixture.repository.list_artifacts(&job.id).await?.len(), 1);
+    let artifact_page = fixture
+        .repository
+        .list_artifacts_page(&job.id, None)
+        .await?;
+    assert_eq!(artifact_page.items, vec![first_artifact.clone()]);
+    assert!(artifact_page.next_cursor.is_none());
     assert!(matches!(
         fixture
             .repository
@@ -1039,6 +1222,20 @@ async fn artifact_debug_webhook_and_audit_guards_hold(pool: PgPool) -> TestResul
             Utc::now() + Duration::hours(1),
         )
         .await?;
+    sqlx::query(
+        "UPDATE debug_sessions SET created_at = now() - interval '10 minutes', \
+         expires_at = now() - interval '5 minutes' WHERE id = $1",
+    )
+    .bind(expired.id.as_str())
+    .execute(&pool)
+    .await?;
+    let expired_sessions = fixture
+        .repository
+        .find_expired_debug_sessions(Utc::now(), 10)
+        .await?;
+    assert_eq!(expired_sessions.len(), 1);
+    assert_eq!(expired_sessions[0].id, expired.id);
+
     let ended = fixture
         .repository
         .create_debug_session(
@@ -1049,16 +1246,16 @@ async fn artifact_debug_webhook_and_audit_guards_hold(pool: PgPool) -> TestResul
             Utc::now() + Duration::hours(1),
         )
         .await?;
+    let expired_ended_at: Option<chrono::DateTime<Utc>> =
+        sqlx::query_scalar("SELECT ended_at FROM debug_sessions WHERE id = $1")
+            .bind(expired.id.as_str())
+            .fetch_one(&pool)
+            .await?;
+    assert!(
+        expired_ended_at.is_some(),
+        "creating a replacement ends the expired session"
+    );
     fixture.repository.end_debug_session(&ended.id).await?;
-    for session_id in [&expired.id, &ended.id] {
-        sqlx::query(
-            "UPDATE debug_sessions SET created_at = now() - interval '10 minutes', \
-             expires_at = now() - interval '5 minutes' WHERE id = $1",
-        )
-        .bind(session_id.as_str())
-        .execute(&pool)
-        .await?;
-    }
     let unexpired = fixture
         .repository
         .create_debug_session(
@@ -1069,13 +1266,41 @@ async fn artifact_debug_webhook_and_audit_guards_hold(pool: PgPool) -> TestResul
             Utc::now() + Duration::hours(1),
         )
         .await?;
-    let expired_sessions = fixture
-        .repository
-        .find_expired_debug_sessions(Utc::now(), 10)
+    assert!(matches!(
+        fixture
+            .repository
+            .create_debug_session(
+                &job.id,
+                "jti-active-conflict",
+                "debugger",
+                DebugSessionMode::Controller,
+                Utc::now() + Duration::hours(1),
+            )
+            .await,
+        Err(RepositoryError::Conflict(_))
+    ));
+    fixture.repository.end_debug_session(&unexpired.id).await?;
+
+    sqlx::query("UPDATE jobs SET state = 'debug_available' WHERE id = $1")
+        .bind(job.id.as_str())
+        .execute(&pool)
         .await?;
-    assert_eq!(expired_sessions.len(), 1);
-    assert_eq!(expired_sessions[0].id, expired.id);
-    assert_ne!(expired_sessions[0].id, unexpired.id);
+    let audited_session = fixture
+        .repository
+        .create_debug_session_with_audit(
+            &job.id,
+            "jti-audited",
+            "debugger",
+            DebugSessionMode::Viewer,
+            Utc::now() + Duration::minutes(15),
+            BTreeMap::from([("source".to_owned(), json!("api"))]),
+        )
+        .await?;
+    assert_eq!(audited_session.audit.action, "debug_session.created");
+    assert_eq!(
+        audited_session.audit.subject,
+        audited_session.session.id.as_str()
+    );
 
     let webhook_request = CreateWebhookRequest {
         project_id: fixture.project_id.clone(),
@@ -1093,6 +1318,83 @@ async fn artifact_debug_webhook_and_audit_guards_hold(pool: PgPool) -> TestResul
             .await?,
         vec![webhook.clone()]
     );
+    let second_webhook = fixture
+        .repository
+        .create_webhook(CreateWebhookRequest {
+            project_id: fixture.project_id.clone(),
+            url: Uri::new("https://hooks-two.example.test/jobs")?,
+            events: vec![WebhookEvent::JobStateChanged],
+        })
+        .await?;
+    let webhook_job = fixture.create_job("webhook-delivery-job").await?;
+    let webhook_event = webhook_job
+        .queued_event
+        .expect("new jobs include their queued state-transition event");
+    let webhook_outbox = fixture
+        .repository
+        .get_outbox_message(&format!("webhook:{}:{}", webhook_event.id, webhook.id))
+        .await?
+        .expect("state changes with active subscribers create a webhook outbox row");
+    assert_eq!(webhook_outbox.subject, "webhooks.job_state_changed");
+    let webhook_payload = serde_json::from_value::<run_anywhere_repository::WebhookOutboxPayload>(
+        webhook_outbox.payload,
+    )?;
+    assert_eq!(webhook_payload.webhook_id, webhook.id);
+    assert_eq!(webhook_payload.url, webhook.url);
+    assert_eq!(webhook_payload.event, webhook_event);
+    let second_webhook_outbox = fixture
+        .repository
+        .get_outbox_message(&format!(
+            "webhook:{}:{}",
+            webhook_event.id, second_webhook.id
+        ))
+        .await?
+        .expect("each active subscriber receives its own durable outbox row");
+    let second_payload = serde_json::from_value::<run_anywhere_repository::WebhookOutboxPayload>(
+        second_webhook_outbox.payload,
+    )?;
+    assert_eq!(second_payload.webhook_id, second_webhook.id);
+    assert_eq!(second_payload.url, second_webhook.url);
+    assert_eq!(second_payload.event, webhook_event);
+    let informational_event = fixture
+        .repository
+        .append_job_event(
+            &webhook_job.job.id,
+            "job.informational_probe",
+            Some(JobState::Queued),
+            BTreeMap::new(),
+        )
+        .await?;
+    for webhook_id in [&webhook.id, &second_webhook.id] {
+        assert!(
+            fixture
+                .repository
+                .get_outbox_message(&format!(
+                    "webhook:{}:{}",
+                    informational_event.id, webhook_id
+                ))
+                .await?
+                .is_none(),
+            "events that merely report a state must not masquerade as state transitions"
+        );
+    }
+    let leased_webhooks = fixture
+        .repository
+        .lease_outbox_messages_for_subject(
+            "webhook-test-dispatcher",
+            "webhooks.job_state_changed",
+            Duration::seconds(30),
+            10,
+        )
+        .await?;
+    assert_eq!(leased_webhooks.len(), 2);
+    assert_eq!(
+        leased_webhooks
+            .iter()
+            .map(|message| message.id)
+            .collect::<HashSet<_>>(),
+        HashSet::from([webhook_outbox.id, second_webhook_outbox.id])
+    );
     assert!(matches!(
         fixture.repository.create_webhook(webhook_request).await,
         Err(RepositoryError::Conflict(_))
@@ -1101,6 +1403,13 @@ async fn artifact_debug_webhook_and_audit_guards_hold(pool: PgPool) -> TestResul
         !fixture
             .repository
             .deactivate_webhook(&webhook.id)
+            .await?
+            .active
+    );
+    assert!(
+        !fixture
+            .repository
+            .deactivate_webhook(&second_webhook.id)
             .await?
             .active
     );
