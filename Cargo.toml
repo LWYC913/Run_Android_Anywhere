@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crates/contracts",
+    "crates/repository",
     "crates/api",
     "crates/scheduler",
     "crates/worker",
@@ -16,6 +17,7 @@ repository = "https://github.com/LWYC913/Run_Android_Anywhere"
 
 [workspace.dependencies]
 run-anywhere-contracts = { version = "0.1.0", path = "crates/contracts" }
+run-anywhere-repository = { version = "0.1.0", path = "crates/repository" }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
