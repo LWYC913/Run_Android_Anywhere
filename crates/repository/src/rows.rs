@@ -8,10 +8,10 @@ use serde_json::Value;
 use sqlx::FromRow;
 
 use crate::{
-    ApiKeyHash, ApiKeyRecord, AuditEntry, RepositoryError, RepositoryResult, StoredArtifact,
-    StoredDebugSession, StoredUpload,
+    ApiKeyHash, ApiKeyRecord, AuditEntry, OutboxMessage, RepositoryError, RepositoryResult,
+    StoredArtifact, StoredDebugSession, StoredUpload,
     codec::{
-        artifacts_from_value, automation_from_value, decode_enum, failure_from_value,
+        artifacts_from_value, automation_from_value, decode_enum, decode_json, failure_from_value,
         payload_from_value, to_u16, to_u32, to_u64,
     },
 };
@@ -304,6 +304,7 @@ pub(crate) struct WorkerRow {
     pub active_jobs: i64,
     pub state: String,
     pub last_heartbeat_at: DateTime<Utc>,
+    pub registered_at: DateTime<Utc>,
 }
 
 impl WorkerRow {
@@ -323,6 +324,43 @@ impl WorkerRow {
             active_jobs: to_u32("workers.active_jobs", self.active_jobs)?,
             state: decode_enum("workers.state", self.state)?,
             last_seen: self.last_heartbeat_at,
+        })
+    }
+}
+
+#[derive(Debug, FromRow)]
+pub(crate) struct OutboxRow {
+    pub id: i64,
+    pub event_key: String,
+    pub subject: String,
+    pub payload: Value,
+    pub trace_headers: Value,
+    pub available_at: DateTime<Utc>,
+    pub attempts: i64,
+    pub locked_by: Option<String>,
+    pub locked_at: Option<DateTime<Utc>>,
+    pub published_at: Option<DateTime<Utc>>,
+    pub last_error: Option<String>,
+    pub created_at: DateTime<Utc>,
+}
+
+impl TryFrom<OutboxRow> for OutboxMessage {
+    type Error = RepositoryError;
+
+    fn try_from(row: OutboxRow) -> Result<Self, Self::Error> {
+        Ok(Self {
+            id: row.id,
+            event_key: row.event_key,
+            subject: row.subject,
+            payload: row.payload,
+            trace_headers: decode_json("outbox_messages.trace_headers", row.trace_headers)?,
+            available_at: row.available_at,
+            attempts: to_u32("outbox_messages.attempts", row.attempts)?,
+            locked_by: row.locked_by,
+            locked_at: row.locked_at,
+            published_at: row.published_at,
+            last_error: row.last_error,
+            created_at: row.created_at,
         })
     }
 }

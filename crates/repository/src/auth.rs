@@ -7,8 +7,8 @@ use sha2::{Digest, Sha256};
 use sqlx::PgExecutor;
 
 use crate::{
-    ApiKeyHash, ApiKeyRecord, ApiKeySecret, CreatedApiKey, Repository, RepositoryError,
-    RepositoryResult,
+    ApiKeyHash, ApiKeyRecord, ApiKeySecret, CreatedApiKey, CreatedProject, Repository,
+    RepositoryError, RepositoryResult,
     codec::encode_enum,
     rows::{ApiKeyRow, ProjectRow},
 };
@@ -21,16 +21,7 @@ impl Repository {
     ) -> RepositoryResult<Project> {
         let name = name.into();
         let owner = owner.into();
-        if name.trim().is_empty() {
-            return Err(RepositoryError::Validation(
-                "project name must not be blank".to_owned(),
-            ));
-        }
-        if owner.trim().is_empty() {
-            return Err(RepositoryError::Validation(
-                "project owner must not be blank".to_owned(),
-            ));
-        }
+        validate_project(&name, &owner)?;
 
         let row = sqlx::query_as::<_, ProjectRow>(
             "INSERT INTO projects (id, name, owner) VALUES ($1, $2, $3) \
@@ -43,6 +34,50 @@ impl Repository {
         .await
         .map_err(|error| RepositoryError::classify_write(error, "project already exists"))?;
         row.try_into()
+    }
+
+    /// Create a project and its initial API key atomically.
+    pub async fn create_project_with_api_key(
+        &self,
+        name: impl Into<String>,
+        owner: impl Into<String>,
+        scopes: Vec<AuthScope>,
+    ) -> RepositoryResult<CreatedProject> {
+        let name = name.into();
+        let owner = owner.into();
+        validate_project(&name, &owner)?;
+        let scopes = validate_scopes(scopes)?;
+        let (plaintext, hash) = generate_api_key();
+
+        let mut tx = self.pool.begin().await?;
+        let project_row = sqlx::query_as::<_, ProjectRow>(
+            "INSERT INTO projects (id, name, owner) VALUES ($1, $2, $3) \
+             RETURNING id, name, owner, created_at",
+        )
+        .bind(new_id("proj_"))
+        .bind(name)
+        .bind(owner)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|error| RepositoryError::classify_write(error, "project already exists"))?;
+        let project: Project = project_row.try_into()?;
+        let key_row = sqlx::query_as::<_, ApiKeyRow>(
+            "INSERT INTO api_keys (id, project_id, key_hash, scopes) VALUES ($1, $2, $3, $4) \
+             RETURNING id, project_id, key_hash, scopes, created_at, last_used_at, revoked_at",
+        )
+        .bind(new_id("key_"))
+        .bind(project.id.as_str())
+        .bind(hash.as_bytes().as_slice())
+        .bind(scopes)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|error| RepositoryError::classify_write(error, "API key already exists"))?;
+        let api_key = CreatedApiKey {
+            key: ApiKeySecret::new(plaintext),
+            record: key_row.into_record()?,
+        };
+        tx.commit().await?;
+        Ok(CreatedProject { project, api_key })
     }
 
     pub async fn get_project(&self, project_id: &ProjectId) -> RepositoryResult<Option<Project>> {
@@ -61,26 +96,8 @@ impl Repository {
         project_id: &ProjectId,
         scopes: Vec<AuthScope>,
     ) -> RepositoryResult<CreatedApiKey> {
-        if scopes.is_empty() {
-            return Err(RepositoryError::Validation(
-                "an API key must have at least one scope".to_owned(),
-            ));
-        }
-        let mut seen = HashSet::new();
-        let scopes = scopes
-            .into_iter()
-            .map(encode_enum)
-            .collect::<RepositoryResult<Vec<_>>>()?;
-        if !scopes.iter().all(|scope| seen.insert(scope.clone())) {
-            return Err(RepositoryError::Validation(
-                "API key scopes must be unique".to_owned(),
-            ));
-        }
-
-        let mut random = [0_u8; 32];
-        OsRng.fill_bytes(&mut random);
-        let plaintext = format!("raa_sk_{}", URL_SAFE_NO_PAD.encode(random));
-        let hash = Self::hash_api_key(&plaintext);
+        let scopes = validate_scopes(scopes)?;
+        let (plaintext, hash) = generate_api_key();
 
         let row = sqlx::query_as::<_, ApiKeyRow>(
             "INSERT INTO api_keys (id, project_id, key_hash, scopes) VALUES ($1, $2, $3, $4) \
@@ -139,6 +156,47 @@ impl Repository {
         )
         .await
     }
+}
+
+fn validate_project(name: &str, owner: &str) -> RepositoryResult<()> {
+    if name.trim().is_empty() {
+        return Err(RepositoryError::Validation(
+            "project name must not be blank".to_owned(),
+        ));
+    }
+    if owner.trim().is_empty() {
+        return Err(RepositoryError::Validation(
+            "project owner must not be blank".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_scopes(scopes: Vec<AuthScope>) -> RepositoryResult<Vec<String>> {
+    if scopes.is_empty() {
+        return Err(RepositoryError::Validation(
+            "an API key must have at least one scope".to_owned(),
+        ));
+    }
+    let mut seen = HashSet::new();
+    let scopes = scopes
+        .into_iter()
+        .map(encode_enum)
+        .collect::<RepositoryResult<Vec<_>>>()?;
+    if !scopes.iter().all(|scope| seen.insert(scope.clone())) {
+        return Err(RepositoryError::Validation(
+            "API key scopes must be unique".to_owned(),
+        ));
+    }
+    Ok(scopes)
+}
+
+fn generate_api_key() -> (String, ApiKeyHash) {
+    let mut random = [0_u8; 32];
+    OsRng.fill_bytes(&mut random);
+    let plaintext = format!("raa_sk_{}", URL_SAFE_NO_PAD.encode(random));
+    let hash = Repository::hash_api_key(&plaintext);
+    (plaintext, hash)
 }
 
 async fn update_api_key_timestamp<'e, E>(

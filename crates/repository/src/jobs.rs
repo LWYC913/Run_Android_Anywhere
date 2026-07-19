@@ -3,18 +3,21 @@ use std::collections::BTreeMap;
 use chrono::{DateTime, Duration, Utc};
 use run_anywhere_contracts::{
     AndroidAbi, ArtifactKind, CreateJobRequest, ErrorCode, FailureDetail, HostArch, IsolationTier,
-    Job, JobClaim, JobEvent, JobId, JobOutcome, JobPage, JobResult, JobState, LeaseId, RuntimeKind,
-    RuntimeProfile, Sha256, TransitionEvidence, UploadKind, WorkerId, validate_transition,
+    Job, JobClaim, JobEvent, JobId, JobOutcome, JobPage, JobQueued, JobResult, JobState, LeaseId,
+    ProjectId, RuntimeKind, RuntimeProfile, Sha256, TransitionEvidence, UploadKind, WorkerId,
+    validate_transition,
 };
 use serde_json::{Value, json};
 use sqlx::{Postgres, QueryBuilder};
 
 use crate::{
-    CreatedJob, JobCursor, JobListQuery, LeaseGuard, RecoveryDisposition, Repository,
-    RepositoryError, RepositoryResult, StaleJob, StaleJobCriteria, StoredArtifact,
+    ArtifactCursor, CreatedJob, JobCursor, JobListQuery, JobMutation, LeaseGuard,
+    RecoveryDisposition, Repository, RepositoryError, RepositoryResult, StaleJob, StaleJobCriteria,
+    StoredArtifact, StoredArtifactPage, WebhookOutboxPayload,
     auth::new_id,
     codec::{checked_i64, decode_enum, encode_enum, encode_json, to_u32},
-    rows::{ArtifactRow, JobEventRow, JobRow, RuntimeProfileRow, WorkerRow},
+    models::{CONTROL_PLANE_PAGE_SIZE, decode_route_cursor, encode_route_cursor},
+    rows::{ArtifactRow, JobEventRow, JobRow, RuntimeProfileRow, WebhookRow, WorkerRow},
 };
 
 const JOB_COLUMNS: &str = "id, project_id, apk_upload_id, test_upload_id, runtime_profile_id, \
@@ -32,17 +35,19 @@ impl Repository {
         request: CreateJobRequest,
         idempotency_key: impl Into<String>,
     ) -> RepositoryResult<CreatedJob> {
+        self.create_job_with_outbox(request, idempotency_key, BTreeMap::new())
+            .await
+    }
+
+    /// Atomically create a job, its initial event, and its queue outbox message.
+    pub async fn create_job_with_outbox(
+        &self,
+        request: CreateJobRequest,
+        idempotency_key: impl Into<String>,
+        trace_headers: BTreeMap<String, String>,
+    ) -> RepositoryResult<CreatedJob> {
         let idempotency_key = idempotency_key.into();
-        if idempotency_key.is_empty()
-            || idempotency_key.len() > 255
-            || !idempotency_key
-                .bytes()
-                .all(|byte| (0x21..=0x7e).contains(&byte))
-        {
-            return Err(RepositoryError::Validation(
-                "idempotency key must be 1..=255 visible ASCII bytes".to_owned(),
-            ));
-        }
+        validate_idempotency_key(&idempotency_key)?;
         let mut tx = self.pool.begin().await?;
 
         // Serialize a key before validating its request body. This gives concurrent
@@ -66,6 +71,7 @@ impl Repository {
             return Ok(CreatedJob {
                 job: row.into_job()?,
                 was_created: false,
+                queued_event: None,
             });
         }
 
@@ -131,16 +137,26 @@ impl Repository {
             .fetch_optional(&mut *tx)
             .await?;
 
-        let (row, was_created) = if let Some(row) = inserted {
-            append_event(
+        let (row, was_created, queued_event) = if let Some(row) = inserted {
+            let event = append_event(
                 &mut tx,
                 row.id.as_str(),
                 "job.queued",
                 Some(JobState::Queued),
+                true,
                 BTreeMap::new(),
             )
             .await?;
-            (row, true)
+            let queued = JobQueued {
+                job_id: JobId::new(row.id.clone())
+                    .map_err(|error| RepositoryError::decode("jobs.id", error))?,
+                project_id: request.project_id.clone(),
+                runtime_profile: profile,
+                min_isolation: request.min_isolation,
+                timeout_seconds: request.timeout_seconds,
+            };
+            insert_job_queued_outbox(&mut tx, &queued, trace_headers).await?;
+            (row, true, Some(event))
         } else {
             let select = format!(
                 "SELECT {JOB_COLUMNS} FROM jobs WHERE project_id = $1 AND idempotency_key = $2"
@@ -155,13 +171,32 @@ impl Repository {
                         "idempotent job winner was not visible after conflict".to_owned(),
                     )
                 })?;
-            (row, false)
+            (row, false, None)
         };
         tx.commit().await?;
         Ok(CreatedJob {
             job: row.into_job()?,
             was_created,
+            queued_event,
         })
+    }
+
+    pub async fn find_job_by_idempotency_key(
+        &self,
+        project_id: &ProjectId,
+        idempotency_key: &str,
+    ) -> RepositoryResult<Option<Job>> {
+        validate_idempotency_key(idempotency_key)?;
+        let query = format!(
+            "SELECT {JOB_COLUMNS} FROM jobs WHERE project_id = $1 AND idempotency_key = $2"
+        );
+        sqlx::query_as::<_, JobRow>(&query)
+            .bind(project_id.as_str())
+            .bind(idempotency_key)
+            .fetch_optional(&self.pool)
+            .await?
+            .map(JobRow::into_job)
+            .transpose()
     }
 
     pub async fn get_job(&self, job_id: &JobId) -> RepositoryResult<Option<Job>> {
@@ -172,6 +207,65 @@ impl Repository {
             .await?
             .map(JobRow::into_job)
             .transpose()
+    }
+
+    /// Request cancellation at the existing artifact-finalization boundary.
+    /// Repeating the same request is idempotent and does not append another event.
+    pub async fn request_job_cancellation(&self, job_id: &JobId) -> RepositoryResult<JobMutation> {
+        let mut tx = self.pool.begin().await?;
+        let current = lock_job(&mut tx, job_id.as_str())
+            .await?
+            .ok_or_else(|| RepositoryError::not_found("job", job_id.as_str()))?;
+        let current_state: JobState = decode_enum("jobs.state", current.state.clone())?;
+        if current_state.is_terminal() {
+            return Err(RepositoryError::Conflict(
+                "cannot cancel a terminal job".to_owned(),
+            ));
+        }
+        if let Some(pending) = current.pending_outcome.as_ref() {
+            let pending: JobOutcome = decode_enum("jobs.pending_outcome", pending.clone())?;
+            if pending == JobOutcome::Cancelled {
+                tx.commit().await?;
+                return Ok(JobMutation {
+                    job: current.into_job()?,
+                    was_changed: false,
+                    event: None,
+                });
+            }
+            return Err(RepositoryError::Conflict(format!(
+                "job already has pending outcome {pending:?}"
+            )));
+        }
+
+        let update = format!(
+            "UPDATE jobs SET state = 'collecting_artifacts', pending_outcome = 'cancelled' \
+             WHERE id = $1 AND state = $2 AND pending_outcome IS NULL \
+             RETURNING {JOB_COLUMNS}"
+        );
+        let row = sqlx::query_as::<_, JobRow>(&update)
+            .bind(job_id.as_str())
+            .bind(encode_enum(current_state)?)
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or_else(|| RepositoryError::CompareAndSwapLost {
+                entity: "job cancellation",
+                id: job_id.to_string(),
+            })?;
+        let event = append_event(
+            &mut tx,
+            job_id.as_str(),
+            "job.cancellation_requested",
+            Some(JobState::CollectingArtifacts),
+            current_state != JobState::CollectingArtifacts,
+            BTreeMap::from([("previous_state".to_owned(), json!(current_state))]),
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(JobMutation {
+            job: row.into_job()?,
+            was_changed: true,
+            event: Some(event),
+        })
     }
 
     pub async fn list_jobs(&self, query: JobListQuery) -> RepositoryResult<JobPage> {
@@ -298,6 +392,7 @@ impl Repository {
             job_id.as_str(),
             "job.claimed",
             Some(JobState::Claimed),
+            true,
             BTreeMap::from([
                 ("worker_id".to_owned(), json!(worker_id)),
                 ("lease_id".to_owned(), json!(lease_id)),
@@ -384,6 +479,7 @@ impl Repository {
             job_id.as_str(),
             &format!("job.{target}"),
             Some(to),
+            expected_from != to,
             event_payload,
         )
         .await?;
@@ -470,6 +566,7 @@ impl Repository {
             result.job_id.as_str(),
             "job.result_recorded",
             Some(state),
+            false,
             BTreeMap::from([
                 ("outcome".to_owned(), json!(result.outcome)),
                 ("completed_at".to_owned(), json!(result.completed_at)),
@@ -607,6 +704,7 @@ impl Repository {
                 "job.recovery_exhausted"
             },
             Some(new_state),
+            new_state != stale.state,
             BTreeMap::from([
                 (
                     "delivery_attempts".to_owned(),
@@ -635,7 +733,8 @@ impl Repository {
     ) -> RepositoryResult<JobEvent> {
         let event_type = event_type.into();
         let mut tx = self.pool.begin().await?;
-        let event = append_event(&mut tx, job_id.as_str(), &event_type, state, payload).await?;
+        let event =
+            append_event(&mut tx, job_id.as_str(), &event_type, state, false, payload).await?;
         tx.commit().await?;
         Ok(event)
     }
@@ -742,6 +841,69 @@ impl Repository {
         .map(TryInto::try_into)
         .collect()
     }
+
+    pub async fn list_artifacts_page(
+        &self,
+        job_id: &JobId,
+        cursor: Option<&str>,
+    ) -> RepositoryResult<StoredArtifactPage> {
+        let cursor = cursor
+            .map(|value| decode_route_cursor::<ArtifactCursor>("job_artifacts", value))
+            .transpose()?;
+        if cursor
+            .as_ref()
+            .is_some_and(|cursor| cursor.job_id != job_id.as_str())
+        {
+            return Err(RepositoryError::Validation(
+                "artifact cursor belongs to a different job".to_owned(),
+            ));
+        }
+        let mut builder = QueryBuilder::<Postgres>::new(
+            "SELECT id, job_id, kind, s3_key, file_name, size_bytes, sha256, created_at \
+             FROM artifacts WHERE job_id = ",
+        );
+        builder.push_bind(job_id.as_str());
+        if let Some(cursor) = cursor {
+            builder.push(" AND (created_at, id) < (");
+            builder.push_bind(cursor.created_at);
+            builder.push(", ");
+            builder.push_bind(cursor.artifact_id);
+            builder.push(")");
+        }
+        builder.push(" ORDER BY created_at DESC, id DESC LIMIT ");
+        builder.push_bind(CONTROL_PLANE_PAGE_SIZE + 1);
+        let mut rows = builder
+            .build_query_as::<ArtifactRow>()
+            .fetch_all(&self.pool)
+            .await?;
+        let has_more =
+            rows.len() > usize::try_from(CONTROL_PLANE_PAGE_SIZE).expect("page size is positive");
+        if has_more {
+            rows.pop();
+        }
+        let items = rows
+            .into_iter()
+            .map(TryInto::try_into)
+            .collect::<RepositoryResult<Vec<StoredArtifact>>>()?;
+        let next_cursor = if has_more {
+            items
+                .last()
+                .map(|item| {
+                    encode_route_cursor(
+                        "job_artifacts",
+                        ArtifactCursor {
+                            job_id: job_id.to_string(),
+                            created_at: item.artifact.created_at,
+                            artifact_id: item.artifact.id.to_string(),
+                        },
+                    )
+                })
+                .transpose()?
+        } else {
+            None
+        };
+        Ok(StoredArtifactPage { items, next_cursor })
+    }
 }
 
 #[derive(Debug, sqlx::FromRow)]
@@ -774,6 +936,47 @@ impl StaleJobRow {
             worker_heartbeat_before: self.worker_heartbeat_before,
         })
     }
+}
+
+fn validate_idempotency_key(idempotency_key: &str) -> RepositoryResult<()> {
+    if idempotency_key.is_empty()
+        || idempotency_key.len() > 255
+        || !idempotency_key
+            .bytes()
+            .all(|byte| (0x21..=0x7e).contains(&byte))
+    {
+        return Err(RepositoryError::Validation(
+            "idempotency key must be 1..=255 visible ASCII bytes".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+async fn insert_job_queued_outbox(
+    tx: &mut sqlx::Transaction<'_, Postgres>,
+    queued: &JobQueued,
+    trace_headers: BTreeMap<String, String>,
+) -> RepositoryResult<()> {
+    if trace_headers.keys().any(|key| key.trim().is_empty()) {
+        return Err(RepositoryError::Validation(
+            "outbox trace header names must not be blank".to_owned(),
+        ));
+    }
+    let payload = encode_json("outbox_messages.payload", queued)?;
+    let trace_headers = encode_json("outbox_messages.trace_headers", trace_headers)?;
+    sqlx::query(
+        "INSERT INTO outbox_messages (event_key, subject, payload, trace_headers) \
+         VALUES ($1, 'jobs.queued', $2, $3)",
+    )
+    .bind(queued.job_id.as_str())
+    .bind(payload)
+    .bind(trace_headers)
+    .execute(&mut **tx)
+    .await
+    .map_err(|error| {
+        RepositoryError::classify_write(error, "job already has a queued outbox message")
+    })?;
+    Ok(())
 }
 
 async fn require_upload_kind(
@@ -920,6 +1123,7 @@ async fn append_event(
     job_id: &str,
     event_type: &str,
     state: Option<JobState>,
+    state_changed: bool,
     payload: BTreeMap<String, Value>,
 ) -> RepositoryResult<JobEvent> {
     if event_type.trim().is_empty() {
@@ -937,6 +1141,11 @@ async fn append_event(
     if exists.is_none() {
         return Err(RepositoryError::not_found("job", job_id));
     }
+    if state_changed && state.is_none() {
+        return Err(RepositoryError::Validation(
+            "a state-transition event must include its resulting state".to_owned(),
+        ));
+    }
     let state = state.map(encode_enum).transpose()?;
     let payload = encode_json("job_events.payload", payload)?;
     let row = sqlx::query_as::<_, JobEventRow>(
@@ -951,7 +1160,50 @@ async fn append_event(
     .bind(payload)
     .fetch_one(&mut **tx)
     .await?;
-    row.try_into()
+    let event: JobEvent = row.try_into()?;
+    if state_changed {
+        insert_webhook_event_outbox(tx, &event).await?;
+    }
+    Ok(event)
+}
+
+async fn insert_webhook_event_outbox(
+    tx: &mut sqlx::Transaction<'_, Postgres>,
+    event: &JobEvent,
+) -> RepositoryResult<()> {
+    const SUBJECT: &str = "webhooks.job_state_changed";
+    let rows = sqlx::query_as::<_, WebhookRow>(
+        "SELECT webhook.id, webhook.project_id, webhook.url, webhook.events, \
+                webhook.active, webhook.created_at \
+         FROM webhooks AS webhook \
+         JOIN jobs AS job ON job.project_id = webhook.project_id \
+         WHERE job.id = $1 AND webhook.active \
+           AND 'job_state_changed' = ANY(webhook.events) \
+         ORDER BY webhook.id",
+    )
+    .bind(event.job_id.as_str())
+    .fetch_all(&mut **tx)
+    .await?;
+    for row in rows {
+        let webhook: run_anywhere_contracts::Webhook = row.try_into()?;
+        let delivery = WebhookOutboxPayload {
+            webhook_id: webhook.id.clone(),
+            url: webhook.url,
+            event: event.clone(),
+        };
+        let payload = encode_json("outbox_messages.payload", delivery)?;
+        sqlx::query(
+            "INSERT INTO outbox_messages (event_key, subject, payload, trace_headers) \
+             VALUES ($1, $2, $3, '{}'::JSONB) \
+             ON CONFLICT (event_key) DO NOTHING",
+        )
+        .bind(format!("webhook:{}:{}", event.id, webhook.id))
+        .bind(SUBJECT)
+        .bind(payload)
+        .execute(&mut **tx)
+        .await?;
+    }
+    Ok(())
 }
 
 async fn verify_artifact_ids(

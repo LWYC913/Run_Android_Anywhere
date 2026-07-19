@@ -93,6 +93,8 @@ paths:
           $ref: '#/components/responses/ConflictError'
         '500':
           $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/InfrastructureError'
 
   /v1/uploads/apk:
     post:
@@ -128,6 +130,7 @@ paths:
                 upload_url: https://objects.example/uploads/upl_app_debug?signature=example
                 required_headers:
                   Content-Type: application/vnd.android.package-archive
+                  x-amz-checksum-sha256: OnvT4jYKPYDheXxcK3lh5XCStF9y+HS0+9ArXjXXpkw=
                 expires_at: '2026-07-13T08:45:00Z'
         '400':
           $ref: '#/components/responses/ValidationError'
@@ -260,6 +263,8 @@ paths:
           $ref: '#/components/responses/NotFoundError'
         '500':
           $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/InfrastructureError'
 
   /v1/jobs/{job_id}:
     get:
@@ -310,6 +315,8 @@ paths:
           $ref: '#/components/responses/NotFoundError'
         '500':
           $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/InfrastructureError'
 
   /v1/jobs/{job_id}/events:
     get:
@@ -349,6 +356,8 @@ paths:
           $ref: '#/components/responses/NotFoundError'
         '500':
           $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/InfrastructureError'
 
   /v1/jobs/{job_id}/artifacts:
     get:
@@ -492,6 +501,8 @@ paths:
           $ref: '#/components/responses/ConflictError'
         '500':
           $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/InfrastructureError'
 
   /v1/webhooks:
     post:
@@ -540,6 +551,8 @@ paths:
           $ref: '#/components/responses/QuotaExceededError'
         '500':
           $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/InfrastructureError'
 
   /v1/workers:
     get:
@@ -578,6 +591,8 @@ paths:
           $ref: '#/components/responses/ForbiddenError'
         '500':
           $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/InfrastructureError'
 
   /v1/runtime-profiles:
     get:
@@ -615,6 +630,8 @@ paths:
           $ref: '#/components/responses/ForbiddenError'
         '500':
           $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/InfrastructureError'
 
 components:
   securitySchemes:

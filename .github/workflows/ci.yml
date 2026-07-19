@@ -13,6 +13,25 @@ jobs:
     runs-on: ubuntu-latest
     env:
       DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
+      BOOTSTRAP_ADMIN_TOKEN: ci-bootstrap-admin-token
+      NATS_URL: nats://127.0.0.1:4222
+      NATS_MONITOR_PORT: "8222"
+      S3_ENDPOINT: http://127.0.0.1:9000
+      S3_REGION: us-east-1
+      S3_BUCKET: run-anywhere
+      S3_ACCESS_KEY_ID: minioadmin
+      S3_SECRET_ACCESS_KEY: minioadmin
+      S3_FORCE_PATH_STYLE: "true"
+      RUN_OBJECT_STORE_INTEGRATION: "true"
+      RUN_QUEUE_INTEGRATION: "true"
+      AWS_ACCESS_KEY_ID: minioadmin
+      AWS_SECRET_ACCESS_KEY: minioadmin
+      AWS_EC2_METADATA_DISABLED: "true"
+      JWT_SIGNING_KEY_FILE: .ci/debug-jwt-private.pem
+      JWT_KID: raa-debug-ci-v1
+      DEBUG_TOKEN_TTL_SECONDS: "900"
+      DEBUG_GATEWAY_BASE_URL: http://127.0.0.1:8081
+      RUN_MIGRATIONS: "true"
     services:
       postgres:
         image: postgres:16-alpine
@@ -30,6 +49,32 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
+
+      - name: Start NATS JetStream and MinIO
+        run: |
+          docker run --detach --name raa-nats --publish 4222:4222 --publish 8222:8222 nats:2.10-alpine -js -m 8222
+          docker run --detach --name raa-minio --publish 9000:9000 --publish 9001:9001 \
+            --env MINIO_ROOT_USER="$S3_ACCESS_KEY_ID" \
+            --env MINIO_ROOT_PASSWORD="$S3_SECRET_ACCESS_KEY" \
+            quay.io/minio/minio:RELEASE.2025-04-22T22-12-26Z server /data --console-address ":9001"
+
+      - name: Prepare control-plane test infrastructure
+        run: |
+          for attempt in {1..30}; do
+            if curl --fail --silent http://127.0.0.1:8222/jsz >/dev/null && \
+               curl --fail --silent http://127.0.0.1:9000/minio/health/live >/dev/null; then
+              break
+            fi
+            if [ "$attempt" -eq 30 ]; then
+              docker logs raa-nats
+              docker logs raa-minio
+              exit 1
+            fi
+            sleep 2
+          done
+          mkdir -p .ci
+          openssl genpkey -algorithm Ed25519 -out "$JWT_SIGNING_KEY_FILE"
+          aws --endpoint-url "$S3_ENDPOINT" s3api create-bucket --bucket "$S3_BUCKET" --region "$S3_REGION"
 
       - name: Install stable Rust
         uses: dtolnay/rust-toolchain@stable
@@ -50,6 +95,9 @@ jobs:
 
       - name: Install just
         uses: taiki-e/install-action@just
+
+      - name: Verify control-plane dependencies
+        run: just infra-check
 
       - name: Run the complete validation suite
         run: just ci

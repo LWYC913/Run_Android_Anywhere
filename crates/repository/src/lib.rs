@@ -14,6 +14,7 @@ mod rows;
 mod auth;
 mod jobs;
 mod misc;
+mod outbox;
 mod uploads;
 mod workers;
 

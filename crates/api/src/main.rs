@@ -1,5 +1,4 @@
-//! Control-plane API placeholder.
-//!
-//! HTTP behavior is intentionally deferred to Part 03.
-
-fn main() {}
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    run_anywhere_api::run().await
+}

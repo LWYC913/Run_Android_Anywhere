@@ -3,8 +3,8 @@ use std::{collections::BTreeMap, fmt};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use chrono::{DateTime, Utc};
 use run_anywhere_contracts::{
-    Artifact, AuthScope, DebugSessionId, DebugSessionMode, Job, JobId, JobLeaseExtension, JobState,
-    LeaseId, ProjectId, Sha256, UploadId, UploadKind, WorkerId,
+    Artifact, AuthScope, DebugSessionId, DebugSessionMode, Job, JobEvent, JobId, JobLeaseExtension,
+    JobState, LeaseId, Project, ProjectId, Sha256, UploadId, UploadKind, Uri, WebhookId, WorkerId,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -71,6 +71,13 @@ pub struct CreatedApiKey {
     pub record: ApiKeyRecord,
 }
 
+/// A project and its first API key, committed as one database transaction.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CreatedProject {
+    pub project: Project,
+    pub api_key: CreatedApiKey,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StoredUpload {
     pub id: UploadId,
@@ -86,6 +93,12 @@ pub struct StoredUpload {
 pub struct StoredArtifact {
     pub artifact: Artifact,
     pub s3_key: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StoredArtifactPage {
+    pub items: Vec<StoredArtifact>,
+    pub next_cursor: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -110,6 +123,12 @@ pub struct AuditEntry {
     pub payload: BTreeMap<String, Value>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CreatedDebugSession {
+    pub session: StoredDebugSession,
+    pub audit: AuditEntry,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct JobCursor {
     pub created_at: DateTime<Utc>,
@@ -118,17 +137,11 @@ pub struct JobCursor {
 
 impl JobCursor {
     pub fn encode(&self) -> RepositoryResult<String> {
-        let bytes =
-            serde_json::to_vec(self).map_err(|error| RepositoryError::decode("cursor", error))?;
-        Ok(URL_SAFE_NO_PAD.encode(bytes))
+        encode_route_cursor("jobs", self.clone())
     }
 
     pub fn decode(value: &str) -> RepositoryResult<Self> {
-        let bytes = URL_SAFE_NO_PAD
-            .decode(value)
-            .map_err(|error| RepositoryError::Validation(format!("invalid job cursor: {error}")))?;
-        serde_json::from_slice(&bytes)
-            .map_err(|error| RepositoryError::Validation(format!("invalid job cursor: {error}")))
+        decode_route_cursor("jobs", value)
     }
 }
 
@@ -158,6 +171,51 @@ impl JobListQuery {
 pub struct CreatedJob {
     pub job: Job,
     pub was_created: bool,
+    /// The exact persisted event for a winning create. Replays do not emit an event.
+    pub queued_event: Option<JobEvent>,
+}
+
+/// Result of an idempotent state mutation such as cancellation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct JobMutation {
+    pub job: Job,
+    pub was_changed: bool,
+    /// The event committed with the mutation, absent on an idempotent replay.
+    pub event: Option<JobEvent>,
+}
+
+/// A durably persisted message awaiting external publication or delivery.
+#[derive(Clone, Debug, PartialEq)]
+pub struct OutboxMessage {
+    pub id: i64,
+    /// Stable delivery ID. For `jobs.queued`, this is the job ID.
+    pub event_key: String,
+    pub subject: String,
+    pub payload: Value,
+    pub trace_headers: BTreeMap<String, String>,
+    pub available_at: DateTime<Utc>,
+    pub attempts: u32,
+    pub locked_by: Option<String>,
+    pub locked_at: Option<DateTime<Utc>>,
+    pub published_at: Option<DateTime<Utc>>,
+    pub last_error: Option<String>,
+    pub created_at: DateTime<Utc>,
+}
+
+impl OutboxMessage {
+    pub fn payload_bytes(&self) -> RepositoryResult<Vec<u8>> {
+        serde_json::to_vec(&self.payload)
+            .map_err(|error| RepositoryError::decode("outbox_messages.payload", error))
+    }
+}
+
+/// Internal payload for one durable webhook recipient. The outbox key is
+/// stable across retries so receivers can deduplicate at-least-once delivery.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WebhookOutboxPayload {
+    pub webhook_id: WebhookId,
+    pub url: Uri,
+    pub event: JobEvent,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -208,4 +266,94 @@ pub(crate) fn checked_limit(limit: u32) -> RepositoryResult<i64> {
         )));
     }
     Ok(i64::from(limit))
+}
+
+pub(crate) const CONTROL_PLANE_PAGE_SIZE: i64 = 50;
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct ArtifactCursor {
+    pub job_id: String,
+    pub created_at: DateTime<Utc>,
+    pub artifact_id: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct WorkerCursor {
+    pub registered_at: DateTime<Utc>,
+    pub worker_id: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct RuntimeProfileCursor {
+    pub profile_id: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct RouteCursor<T> {
+    route: String,
+    key: T,
+}
+
+pub(crate) fn encode_route_cursor<T: Serialize>(
+    route: &'static str,
+    key: T,
+) -> RepositoryResult<String> {
+    let bytes = serde_json::to_vec(&RouteCursor {
+        route: route.to_owned(),
+        key,
+    })
+    .map_err(|error| RepositoryError::decode("cursor", error))?;
+    Ok(URL_SAFE_NO_PAD.encode(bytes))
+}
+
+pub(crate) fn decode_route_cursor<T: for<'de> Deserialize<'de>>(
+    expected_route: &'static str,
+    value: &str,
+) -> RepositoryResult<T> {
+    let bytes = URL_SAFE_NO_PAD.decode(value).map_err(|error| {
+        RepositoryError::Validation(format!("invalid {expected_route} cursor: {error}"))
+    })?;
+    let cursor: RouteCursor<Value> = serde_json::from_slice(&bytes).map_err(|error| {
+        RepositoryError::Validation(format!("invalid {expected_route} cursor: {error}"))
+    })?;
+    if cursor.route != expected_route {
+        return Err(RepositoryError::Validation(format!(
+            "cursor is for route `{}`, not `{expected_route}`",
+            cursor.route
+        )));
+    }
+    serde_json::from_value(cursor.key).map_err(|error| {
+        RepositoryError::Validation(format!("invalid {expected_route} cursor: {error}"))
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cursors_round_trip_and_are_route_tagged() {
+        let job_cursor = JobCursor {
+            created_at: Utc::now(),
+            job_id: JobId::new("job_cursor_test").expect("valid test ID"),
+        };
+        assert_eq!(
+            JobCursor::decode(&job_cursor.encode().expect("encode job cursor"))
+                .expect("decode job cursor"),
+            job_cursor
+        );
+
+        let worker_cursor = encode_route_cursor(
+            "workers",
+            WorkerCursor {
+                registered_at: Utc::now(),
+                worker_id: "wrk_cursor_test".to_owned(),
+            },
+        )
+        .expect("encode worker cursor");
+        assert!(matches!(
+            JobCursor::decode(&worker_cursor),
+            Err(RepositoryError::Validation(message)) if message.contains("not `jobs`")
+        ));
+    }
 }

@@ -1,11 +1,13 @@
 use run_anywhere_contracts::{
-    ProjectId, RuntimeProfile, RuntimeProfileId, Sha256, UploadId, UploadKind,
+    ProjectId, RuntimeProfile, RuntimeProfileId, RuntimeProfilePage, Sha256, UploadId, UploadKind,
 };
+use sqlx::{Postgres, QueryBuilder};
 
 use crate::{
-    Repository, RepositoryError, RepositoryResult, StoredUpload,
+    Repository, RepositoryError, RepositoryResult, RuntimeProfileCursor, StoredUpload,
     auth::new_id,
     codec::{checked_i64, encode_enum},
+    models::{CONTROL_PLANE_PAGE_SIZE, decode_route_cursor, encode_route_cursor},
     rows::{RuntimeProfileRow, UploadRow},
 };
 
@@ -65,6 +67,53 @@ impl Repository {
         .into_iter()
         .map(TryInto::try_into)
         .collect()
+    }
+
+    pub async fn list_runtime_profiles_page(
+        &self,
+        cursor: Option<&str>,
+    ) -> RepositoryResult<RuntimeProfilePage> {
+        let cursor = cursor
+            .map(|value| decode_route_cursor::<RuntimeProfileCursor>("runtime_profiles", value))
+            .transpose()?;
+        let mut builder = QueryBuilder::<Postgres>::new(
+            "SELECT id, android_api, device_profile, abi, host_arch, runtime_kind, image_ref, \
+             isolation_tier FROM runtime_profiles",
+        );
+        if let Some(cursor) = cursor {
+            builder.push(" WHERE id > ");
+            builder.push_bind(cursor.profile_id);
+        }
+        builder.push(" ORDER BY id LIMIT ");
+        builder.push_bind(CONTROL_PLANE_PAGE_SIZE + 1);
+        let mut rows = builder
+            .build_query_as::<RuntimeProfileRow>()
+            .fetch_all(&self.pool)
+            .await?;
+        let has_more =
+            rows.len() > usize::try_from(CONTROL_PLANE_PAGE_SIZE).expect("page size is positive");
+        if has_more {
+            rows.pop();
+        }
+        let next_cursor = if has_more {
+            rows.last()
+                .map(|row| {
+                    encode_route_cursor(
+                        "runtime_profiles",
+                        RuntimeProfileCursor {
+                            profile_id: row.id.clone(),
+                        },
+                    )
+                })
+                .transpose()?
+        } else {
+            None
+        };
+        let items = rows
+            .into_iter()
+            .map(TryInto::try_into)
+            .collect::<RepositoryResult<_>>()?;
+        Ok(RuntimeProfilePage { items, next_cursor })
     }
 
     pub async fn get_runtime_profile(
