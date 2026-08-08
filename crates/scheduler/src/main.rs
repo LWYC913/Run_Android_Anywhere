@@ -1,5 +1,4 @@
-//! Scheduler placeholder.
-//!
-//! Queue, lease, and reconciliation behavior is intentionally deferred to Part 04.
-
-fn main() {}
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    run_anywhere_scheduler::run().await
+}

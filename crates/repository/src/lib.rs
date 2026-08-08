@@ -20,7 +20,7 @@ mod workers;
 
 use sqlx::{PgPool, postgres::PgPoolOptions};
 
-pub use error::{RepositoryError, RepositoryResult};
+pub use error::{ProjectQuota, RepositoryError, RepositoryResult};
 pub use models::*;
 
 /// Root-level migrations embedded into every service that uses the repository.

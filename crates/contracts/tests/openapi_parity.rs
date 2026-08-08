@@ -67,7 +67,13 @@ use utoipa::OpenApi;
     JobQueued,
     JobClaim,
     JobLeaseExtension,
-    JobResult
+    JobResult,
+    JobDispatch,
+    JobStateTransitionRequest,
+    ControlDisposition,
+    ControlResponse,
+    JobDeadLetterReason,
+    JobDeadLetter
 )))]
 struct RustContractSchemas;
 
@@ -102,6 +108,9 @@ const OBJECT_SCHEMAS: &[&str] = &[
     "JobClaim",
     "JobLeaseExtension",
     "JobResult",
+    "JobDispatch",
+    "JobStateTransitionRequest",
+    "JobDeadLetter",
 ];
 
 const ENUM_SCHEMAS: &[&str] = &[
@@ -119,6 +128,8 @@ const ENUM_SCHEMAS: &[&str] = &[
     "DebugSessionMode",
     "WebhookEvent",
     "ErrorCode",
+    "ControlDisposition",
+    "JobDeadLetterReason",
 ];
 
 const PRIMITIVE_SCHEMAS: &[&str] = &[
@@ -139,7 +150,7 @@ const PRIMITIVE_SCHEMAS: &[&str] = &[
     "DurationSeconds",
 ];
 
-const UNION_SCHEMAS: &[&str] = &["AutomationSpec"];
+const UNION_SCHEMAS: &[&str] = &["AutomationSpec", "ControlResponse"];
 
 fn repository_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")

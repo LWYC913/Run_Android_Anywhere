@@ -4,13 +4,14 @@ use chrono::{Duration, Utc};
 use run_anywhere_contracts::{
     AndroidAbi, ArtifactKind, ArtifactSelection, AuthScope, AutomationSpec, CreateJobRequest,
     CreateWebhookRequest, DebugSessionMode, DurationSeconds, ErrorCode, HostArch, IsolationTier,
-    JobLeaseExtension, JobMode, JobOutcome, JobQueued, JobResult, JobState, JobSummary, LeaseId,
-    ProjectId, RuntimeKind, RuntimeProfile, RuntimeProfileId, Sha256, TransitionEvidence, UploadId,
-    UploadKind, Uri, WebhookEvent, WorkerHeartbeat, WorkerId, WorkerRegistration, WorkerState,
+    JobDeadLetter, JobDeadLetterReason, JobLeaseExtension, JobMode, JobOutcome, JobQueued,
+    JobResult, JobState, JobSummary, LeaseId, ProjectId, RuntimeKind, RuntimeProfile,
+    RuntimeProfileId, Sha256, TransitionEvidence, UploadId, UploadKind, Uri, WebhookEvent,
+    WorkerHeartbeat, WorkerId, WorkerRegistration, WorkerState,
 };
 use run_anywhere_repository::{
-    CreatedJob, JobListQuery, LeaseGuard, MIGRATOR, RecoveryDisposition, Repository,
-    RepositoryError, StaleJobCriteria,
+    ClaimJobOptions, CreatedJob, DebugSessionEndReason, JobListQuery, LeaseGuard, MIGRATOR,
+    ProjectQuota, RecoveryDisposition, Repository, RepositoryError, StaleJobCriteria,
 };
 use serde_json::json;
 use sqlx::PgPool;
@@ -34,6 +35,8 @@ impl Fixture {
         let project = repository
             .create_project("integration project", "test-owner")
             .await?;
+        assert_eq!(project.max_concurrent_jobs, 2);
+        assert_eq!(project.max_outstanding_jobs, 100);
         let upload = repository
             .create_upload(
                 &project.id,
@@ -146,6 +149,21 @@ async fn migrations_are_reversible_and_seed_exact_profiles(pool: PgPool) -> Test
         assert_ne!(profile.runtime_kind, RuntimeKind::BrowserNativeWasm);
     }
 
+    let quota_indexes: Vec<String> = sqlx::query_scalar(
+        "SELECT indexname FROM pg_indexes WHERE schemaname = 'public' \
+         AND indexname IN ('jobs_project_outstanding_idx', 'jobs_project_active_lease_idx') \
+         ORDER BY indexname",
+    )
+    .fetch_all(&pool)
+    .await?;
+    assert_eq!(
+        quota_indexes,
+        vec![
+            "jobs_project_active_lease_idx".to_owned(),
+            "jobs_project_outstanding_idx".to_owned(),
+        ]
+    );
+
     let emulator = profiles
         .iter()
         .find(|profile| profile.id.as_str() == EMULATOR_PROFILE)
@@ -226,6 +244,69 @@ async fn concurrent_job_creation_is_idempotent(pool: PgPool) -> TestResult {
     assert!(!retry.was_created);
     assert!(retry.queued_event.is_none());
     assert_eq!(retry.job.id, left.job.id);
+    Ok(())
+}
+
+#[sqlx::test(migrator = "run_anywhere_repository::MIGRATOR")]
+async fn outstanding_quota_serializes_admission_and_preserves_idempotent_replays(
+    pool: PgPool,
+) -> TestResult {
+    let fixture = Fixture::new(&pool).await?;
+    sqlx::query(
+        "UPDATE projects SET max_concurrent_jobs = 1, max_outstanding_jobs = 1 WHERE id = $1",
+    )
+    .bind(fixture.project_id.as_str())
+    .execute(&pool)
+    .await?;
+
+    let left_repository = fixture.repository.clone();
+    let right_repository = fixture.repository.clone();
+    let (left, right) = tokio::join!(
+        left_repository.create_job(fixture.request(), "quota-left"),
+        right_repository.create_job(fixture.request(), "quota-right")
+    );
+    assert_eq!(usize::from(left.is_ok()) + usize::from(right.is_ok()), 1);
+    let (winner, loser_key, loser) = match (left, right) {
+        (Ok(winner), Err(error)) => (winner, "quota-right", error),
+        (Err(error), Ok(winner)) => (winner, "quota-left", error),
+        result => panic!("unexpected quota race result: {result:?}"),
+    };
+    assert!(matches!(
+        loser,
+        RepositoryError::QuotaExceeded {
+            quota: ProjectQuota::OutstandingJobs,
+            current: 1,
+            limit: 1,
+            ..
+        }
+    ));
+
+    // The actual winning key is still replayable even when its request body is
+    // no longer valid and the project has no remaining outstanding capacity.
+    let winner_key: String = sqlx::query_scalar("SELECT idempotency_key FROM jobs WHERE id = $1")
+        .bind(winner.job.id.as_str())
+        .fetch_one(&pool)
+        .await?;
+    let mut changed_retry = fixture.request();
+    changed_retry.apk_upload_id = UploadId::new("upl_missing_but_idempotent")?;
+    let replay = fixture
+        .repository
+        .create_job(changed_retry, winner_key)
+        .await?;
+    assert!(!replay.was_created);
+    assert_eq!(replay.job.id, winner.job.id);
+    assert_eq!(
+        fixture
+            .repository
+            .create_job(fixture.request(), loser_key)
+            .await
+            .expect_err("a new key remains quota-blocked")
+            .to_string(),
+        format!(
+            "project `{}` reached its max_outstanding_jobs quota (1/1)",
+            fixture.project_id
+        )
+    );
     Ok(())
 }
 
@@ -693,6 +774,171 @@ async fn claim_race_has_one_winner_and_capacity_cannot_overbook(pool: PgPool) ->
 }
 
 #[sqlx::test(migrator = "run_anywhere_repository::MIGRATOR")]
+async fn project_concurrency_quota_is_atomic_and_does_not_consume_attempts(
+    pool: PgPool,
+) -> TestResult {
+    let fixture = Fixture::new(&pool).await?;
+    sqlx::query(
+        "UPDATE projects SET max_concurrent_jobs = 1, max_outstanding_jobs = 10 WHERE id = $1",
+    )
+    .bind(fixture.project_id.as_str())
+    .execute(&pool)
+    .await?;
+    let left_job = fixture.create_job("project-claim-left").await?.job;
+    let right_job = fixture.create_job("project-claim-right").await?.job;
+    let left_worker = register_worker(
+        &fixture.repository,
+        "wrk_project_quota_left",
+        vec![RuntimeKind::AndroidEmulatorContainer],
+        true,
+        HostArch::X86_64,
+        1,
+    )
+    .await?;
+    let right_worker = register_worker(
+        &fixture.repository,
+        "wrk_project_quota_right",
+        vec![RuntimeKind::AndroidEmulatorContainer],
+        true,
+        HostArch::X86_64,
+        1,
+    )
+    .await?;
+    let left_repository = fixture.repository.clone();
+    let right_repository = fixture.repository.clone();
+    let expires_at = Utc::now() + Duration::hours(1);
+    let left_lease = LeaseId::new("lease_project_quota_left")?;
+    let right_lease = LeaseId::new("lease_project_quota_right")?;
+    let (left, right) = tokio::join!(
+        left_repository.claim_job(&left_job.id, &left_worker, &left_lease, expires_at,),
+        right_repository.claim_job(&right_job.id, &right_worker, &right_lease, expires_at,)
+    );
+    assert_eq!(usize::from(left.is_ok()) + usize::from(right.is_ok()), 1);
+    let blocked_job = match (&left, &right) {
+        (
+            Ok(_),
+            Err(RepositoryError::QuotaExceeded {
+                quota: ProjectQuota::ConcurrentJobs,
+                current: 1,
+                limit: 1,
+                ..
+            }),
+        ) => &right_job,
+        (
+            Err(RepositoryError::QuotaExceeded {
+                quota: ProjectQuota::ConcurrentJobs,
+                current: 1,
+                limit: 1,
+                ..
+            }),
+            Ok(_),
+        ) => &left_job,
+        result => panic!("unexpected project quota race result: {result:?}"),
+    };
+    let (state, worker_id, lease_id, attempts): (String, Option<String>, Option<String>, i64) =
+        sqlx::query_as(
+            "SELECT state, worker_id, lease_id, delivery_attempts FROM jobs WHERE id = $1",
+        )
+        .bind(blocked_job.id.as_str())
+        .fetch_one(&pool)
+        .await?;
+    assert_eq!(state, "queued");
+    assert!(worker_id.is_none());
+    assert!(lease_id.is_none());
+    assert_eq!(attempts, 0);
+    assert_eq!(
+        fixture
+            .repository
+            .list_workers()
+            .await?
+            .into_iter()
+            .map(|worker| worker.active_jobs)
+            .sum::<u32>(),
+        1
+    );
+    Ok(())
+}
+
+#[sqlx::test(migrator = "run_anywhere_repository::MIGRATOR")]
+async fn claim_freshness_is_configurable_and_snapshot_is_canonical(pool: PgPool) -> TestResult {
+    let fixture = Fixture::new(&pool).await?;
+    let job = fixture.create_job("freshness-snapshot").await?.job;
+    let worker_id = register_worker(
+        &fixture.repository,
+        "wrk_configurable_freshness",
+        vec![RuntimeKind::AndroidEmulatorContainer],
+        true,
+        HostArch::X86_64,
+        1,
+    )
+    .await?;
+    sqlx::query(
+        "UPDATE workers SET last_heartbeat_at = now() - interval '60 seconds' WHERE id = $1",
+    )
+    .bind(worker_id.as_str())
+    .execute(&pool)
+    .await?;
+    let lease_id = LeaseId::new("lease_configurable_freshness")?;
+    assert!(matches!(
+        fixture
+            .repository
+            .claim_job_with_options(
+                &job.id,
+                &worker_id,
+                &lease_id,
+                Utc::now() + Duration::hours(1),
+                ClaimJobOptions {
+                    worker_stale_after: Duration::seconds(45),
+                },
+            )
+            .await,
+        Err(RepositoryError::Conflict(message)) if message.contains("heartbeat is stale")
+    ));
+    let attempts: i64 = sqlx::query_scalar("SELECT delivery_attempts FROM jobs WHERE id = $1")
+        .bind(job.id.as_str())
+        .fetch_one(&pool)
+        .await?;
+    assert_eq!(attempts, 0);
+
+    sqlx::query("UPDATE workers SET last_heartbeat_at = now() WHERE id = $1")
+        .bind(worker_id.as_str())
+        .execute(&pool)
+        .await?;
+    fixture
+        .repository
+        .claim_job_with_options(
+            &job.id,
+            &worker_id,
+            &lease_id,
+            Utc::now() + Duration::hours(1),
+            ClaimJobOptions {
+                worker_stale_after: Duration::seconds(45),
+            },
+        )
+        .await?;
+    let snapshot = fixture
+        .repository
+        .get_job_scheduling_snapshot(&job.id)
+        .await?
+        .expect("canonical scheduling snapshot");
+    assert_eq!(snapshot.queued.job_id, job.id);
+    assert_eq!(snapshot.queued.project_id, fixture.project_id);
+    assert_eq!(snapshot.queued.runtime_profile_id, fixture.profile.id);
+    assert_eq!(snapshot.runtime_profile, fixture.profile);
+    assert_eq!(snapshot.delivery_attempts, 1);
+    assert!(snapshot.pending_outcome.is_none());
+    assert!(!snapshot.artifacts_finalized);
+    assert!(!snapshot.cleanup_completed);
+    assert_eq!(
+        snapshot.lease.as_ref().map(|lease| &lease.lease_id),
+        Some(&lease_id)
+    );
+    assert!(snapshot.lease_expires_at.is_some());
+    assert!(snapshot.last_lease_extended_at.is_some());
+    Ok(())
+}
+
+#[sqlx::test(migrator = "run_anywhere_repository::MIGRATOR")]
 async fn heartbeat_extends_only_the_exact_owned_lease(pool: PgPool) -> TestResult {
     let fixture = Fixture::new(&pool).await?;
     let job = fixture.create_job("heartbeat-job").await?.job;
@@ -892,6 +1138,30 @@ async fn stale_recovery_requeues_then_routes_exhaustion_to_finalization(
     );
     assert!(exhausted_job.outcome.is_none());
     assert_eq!(fixture.repository.list_workers().await?[0].active_jobs, 0);
+    let dead_letter_key = format!("dlq:{}:2", exhausted_job.id);
+    let dead_letter_outbox = fixture
+        .repository
+        .get_outbox_message(&dead_letter_key)
+        .await?
+        .expect("exhaustion atomically creates a durable DLQ outbox row");
+    assert_eq!(dead_letter_outbox.subject, "jobs.dead");
+    let dead_letter: JobDeadLetter = serde_json::from_value(dead_letter_outbox.payload.clone())?;
+    assert_eq!(dead_letter.job_id.as_ref(), Some(&exhausted_job.id));
+    assert_eq!(dead_letter.project_id.as_ref(), Some(&fixture.project_id));
+    assert_eq!(dead_letter.attempt, 2);
+    assert_eq!(dead_letter.reason, JobDeadLetterReason::AttemptsExhausted);
+    let replayed_dead_letter = fixture
+        .repository
+        .enqueue_job_dead_letter(&dead_letter, BTreeMap::new())
+        .await?;
+    assert_eq!(replayed_dead_letter.id, dead_letter_outbox.id);
+    assert_eq!(
+        fixture
+            .repository
+            .pending_outbox_count_for_subject("jobs.dead")
+            .await?,
+        1
+    );
 
     let heartbeat_stale_job = fixture.create_job("recover-stale-worker").await?.job;
     fixture
@@ -925,6 +1195,92 @@ async fn stale_recovery_requeues_then_routes_exhaustion_to_finalization(
         fixture.repository.recover_stale_job(&stale[0], 2).await?,
         RecoveryDisposition::Requeued(_)
     ));
+    Ok(())
+}
+
+#[sqlx::test(migrator = "run_anywhere_repository::MIGRATOR")]
+async fn cancellation_rejects_lease_extension_and_never_resurrects_on_recovery(
+    pool: PgPool,
+) -> TestResult {
+    let fixture = Fixture::new(&pool).await?;
+    let worker_id = register_worker(
+        &fixture.repository,
+        "wrk_cancel_recovery",
+        vec![RuntimeKind::AndroidEmulatorContainer],
+        true,
+        HostArch::X86_64,
+        1,
+    )
+    .await?;
+    let job = fixture.create_job("cancel-recovery").await?.job;
+    let lease_id = LeaseId::new("lease_cancel_recovery")?;
+    fixture
+        .repository
+        .claim_job(
+            &job.id,
+            &worker_id,
+            &lease_id,
+            Utc::now() + Duration::hours(1),
+        )
+        .await?;
+    fixture.repository.request_job_cancellation(&job.id).await?;
+
+    let extension = JobLeaseExtension {
+        job_id: job.id.clone(),
+        lease_id: lease_id.clone(),
+    };
+    let receipt = fixture
+        .repository
+        .record_heartbeat(
+            WorkerHeartbeat {
+                worker_id: worker_id.clone(),
+                active_jobs: 1,
+                capacity: 1,
+                runtimes: vec![RuntimeKind::AndroidEmulatorContainer],
+                kvm: true,
+                gpu: false,
+                arch: HostArch::X86_64,
+                lease_extends: vec![extension.clone()],
+                last_seen: Utc::now(),
+            },
+            Duration::minutes(3),
+        )
+        .await?;
+    assert!(receipt.extended.is_empty());
+    assert!(receipt.rejected.is_empty());
+    assert_eq!(receipt.cancel_requested, vec![extension]);
+
+    expire_lease(&pool, job.id.as_str(), None).await?;
+    let stale = fixture
+        .repository
+        .find_stale_jobs(StaleJobCriteria {
+            lease_expired_before: Utc::now() + Duration::seconds(1),
+            worker_heartbeat_before: Utc::now() - Duration::hours(1),
+            limit: 10,
+        })
+        .await?;
+    assert_eq!(stale.len(), 1);
+    let recovered = fixture.repository.recover_stale_job(&stale[0], 3).await?;
+    let RecoveryDisposition::Cancelling(recovered) = recovered else {
+        panic!("cancelled work must enter finalization rather than requeue")
+    };
+    assert_eq!(recovered.state, JobState::CollectingArtifacts);
+    assert!(recovered.worker_id.is_none());
+    let snapshot = fixture
+        .repository
+        .get_job_scheduling_snapshot(&job.id)
+        .await?
+        .expect("cancelled job remains canonical");
+    assert_eq!(snapshot.pending_outcome, Some(JobOutcome::Cancelled));
+    assert!(snapshot.lease.is_none());
+    assert_eq!(fixture.repository.list_workers().await?[0].active_jobs, 0);
+    assert_eq!(
+        fixture
+            .repository
+            .pending_outbox_count_for_subject("jobs.dead")
+            .await?,
+        0
+    );
     Ok(())
 }
 
@@ -1442,5 +1798,103 @@ async fn artifact_debug_webhook_and_audit_guards_hold(pool: PgPool) -> TestResul
         .await
         .expect_err("audit entries cannot be deleted");
     assert_append_only_error(&deletion_error);
+    Ok(())
+}
+
+#[sqlx::test(migrator = "run_anywhere_repository::MIGRATOR")]
+async fn debug_session_reconciliation_ends_and_audits_exactly_once(pool: PgPool) -> TestResult {
+    let fixture = Fixture::new(&pool).await?;
+    let job = fixture.create_job("debug-reconciliation").await?.job;
+    sqlx::query("UPDATE jobs SET state = 'debug_available' WHERE id = $1")
+        .bind(job.id.as_str())
+        .execute(&pool)
+        .await?;
+    let expired = fixture
+        .repository
+        .create_debug_session(
+            &job.id,
+            "jti-reconciler-expired",
+            "debugger",
+            DebugSessionMode::Viewer,
+            Utc::now() + Duration::minutes(10),
+        )
+        .await?;
+    sqlx::query(
+        "UPDATE debug_sessions SET created_at = now() - interval '10 minutes', \
+         expires_at = now() - interval '1 minute' WHERE id = $1",
+    )
+    .bind(expired.id.as_str())
+    .execute(&pool)
+    .await?;
+
+    let left_repository = fixture.repository.clone();
+    let right_repository = fixture.repository.clone();
+    let cutoff = Utc::now();
+    let (left, right) = tokio::join!(
+        left_repository.end_expired_or_terminal_debug_sessions_with_audit(
+            cutoff,
+            "scheduler:reconciler-a",
+            10,
+        ),
+        right_repository.end_expired_or_terminal_debug_sessions_with_audit(
+            cutoff,
+            "scheduler:reconciler-b",
+            10,
+        )
+    );
+    let mut ended = left?;
+    ended.extend(right?);
+    assert_eq!(ended.len(), 1);
+    assert_eq!(ended[0].session.id, expired.id);
+    assert_eq!(ended[0].reason, DebugSessionEndReason::Expired);
+    assert_eq!(ended[0].audit.action, "debug_session.ended");
+    assert_eq!(ended[0].audit.payload["reason"], json!("expired"));
+    assert!(
+        fixture
+            .repository
+            .end_expired_or_terminal_debug_sessions_with_audit(
+                Utc::now(),
+                "scheduler:reconciler",
+                10,
+            )
+            .await?
+            .is_empty()
+    );
+
+    let terminal_owned = fixture
+        .repository
+        .create_debug_session(
+            &job.id,
+            "jti-reconciler-terminal",
+            "debugger",
+            DebugSessionMode::Controller,
+            Utc::now() + Duration::hours(1),
+        )
+        .await?;
+    sqlx::query(
+        "UPDATE jobs SET state = 'cancelled', pending_outcome = 'cancelled', \
+         outcome = 'cancelled', artifacts_finalized = TRUE, cleanup_completed = TRUE, \
+         finished_at = clock_timestamp() WHERE id = $1",
+    )
+    .bind(job.id.as_str())
+    .execute(&pool)
+    .await?;
+    let ended = fixture
+        .repository
+        .end_expired_or_terminal_debug_sessions_with_audit(Utc::now(), "scheduler:reconciler", 10)
+        .await?;
+    assert_eq!(ended.len(), 1);
+    assert_eq!(ended[0].session.id, terminal_owned.id);
+    assert_eq!(ended[0].reason, DebugSessionEndReason::JobEnded);
+    assert_eq!(ended[0].audit.payload["reason"], json!("job_ended"));
+
+    let ended_audits: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM audit_log WHERE action = 'debug_session.ended' \
+         AND subject = ANY($1)",
+    )
+    .bind(vec![expired.id.as_str(), terminal_owned.id.as_str()])
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(ended_audits, 2);
     Ok(())
 }

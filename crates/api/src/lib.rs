@@ -13,6 +13,7 @@ pub mod error;
 pub mod events;
 pub mod extract;
 pub mod jobs;
+pub mod nats_connection;
 pub mod object_store;
 pub mod observability;
 pub mod params;
@@ -29,7 +30,7 @@ pub mod webhooks;
 pub mod workers;
 
 pub use app::run;
-pub use config::{Config, ConfigError, S3Config, SecretString};
+pub use config::{Config, ConfigError, NatsConfig, S3Config, SecretString};
 pub use error::{ApiError, ApiResult};
 pub use observability::{ApiMetrics, ObservabilityError, TelemetryGuard};
 pub use router::public_router;

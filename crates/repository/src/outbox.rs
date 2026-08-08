@@ -1,13 +1,33 @@
+use std::collections::BTreeMap;
+
 use chrono::{DateTime, Duration, Utc};
+use run_anywhere_contracts::JobDeadLetter;
+use sqlx::Postgres;
 
 use crate::{
-    OutboxMessage, Repository, RepositoryError, RepositoryResult, codec::to_u64, rows::OutboxRow,
+    OutboxMessage, Repository, RepositoryError, RepositoryResult,
+    codec::{encode_json, to_u64},
+    rows::OutboxRow,
 };
 
 const OUTBOX_COLUMNS: &str = "id, event_key, subject, payload, trace_headers, available_at, \
     attempts, locked_by, locked_at, published_at, last_error, created_at";
 
 impl Repository {
+    /// Durably enqueue a sanitized dead-letter message. Repeating the same
+    /// logical attempt returns the original row without rewriting its payload
+    /// or publish state.
+    pub async fn enqueue_job_dead_letter(
+        &self,
+        dead_letter: &JobDeadLetter,
+        trace_headers: BTreeMap<String, String>,
+    ) -> RepositoryResult<OutboxMessage> {
+        let mut tx = self.pool.begin().await?;
+        let message = insert_job_dead_letter_outbox(&mut tx, dead_letter, trace_headers).await?;
+        tx.commit().await?;
+        Ok(message)
+    }
+
     /// Lease ready messages without blocking other dispatcher replicas.
     /// Stale leases older than `lease_timeout` are reclaimed and every claim
     /// increments the durable attempt counter.
@@ -201,6 +221,55 @@ impl Repository {
     }
 }
 
+pub(crate) async fn insert_job_dead_letter_outbox(
+    tx: &mut sqlx::Transaction<'_, Postgres>,
+    dead_letter: &JobDeadLetter,
+    trace_headers: BTreeMap<String, String>,
+) -> RepositoryResult<OutboxMessage> {
+    dead_letter
+        .validate()
+        .map_err(|error| RepositoryError::Validation(error.to_string()))?;
+    validate_trace_headers(&trace_headers)?;
+    let event_key = dead_letter
+        .idempotency_key()
+        .map_err(|error| RepositoryError::Validation(error.to_string()))?;
+    let payload = encode_json("outbox_messages.payload", dead_letter)?;
+    let trace_headers = encode_json("outbox_messages.trace_headers", trace_headers)?;
+    let insert = format!(
+        "INSERT INTO outbox_messages (event_key, subject, payload, trace_headers) \
+         VALUES ($1, 'jobs.dead', $2, $3) ON CONFLICT (event_key) DO NOTHING \
+         RETURNING {OUTBOX_COLUMNS}"
+    );
+    if let Some(row) = sqlx::query_as::<_, OutboxRow>(&insert)
+        .bind(&event_key)
+        .bind(payload)
+        .bind(trace_headers)
+        .fetch_optional(&mut **tx)
+        .await?
+    {
+        return row.try_into();
+    }
+
+    let select =
+        format!("SELECT {OUTBOX_COLUMNS} FROM outbox_messages WHERE event_key = $1 FOR UPDATE");
+    let row = sqlx::query_as::<_, OutboxRow>(&select)
+        .bind(&event_key)
+        .fetch_optional(&mut **tx)
+        .await?
+        .ok_or_else(|| {
+            RepositoryError::Conflict(
+                "dead-letter outbox winner was not visible after conflict".to_owned(),
+            )
+        })?;
+    if row.subject != "jobs.dead" {
+        return Err(RepositoryError::Conflict(format!(
+            "outbox key `{event_key}` is already used by subject `{}`",
+            row.subject
+        )));
+    }
+    row.try_into()
+}
+
 fn validate_dispatcher_id(dispatcher_id: &str) -> RepositoryResult<()> {
     if dispatcher_id.trim().is_empty() {
         return Err(RepositoryError::Validation(
@@ -214,6 +283,15 @@ fn validate_subject(subject: &str) -> RepositoryResult<()> {
     if subject.trim().is_empty() {
         return Err(RepositoryError::Validation(
             "outbox subject must not be blank".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_trace_headers(trace_headers: &BTreeMap<String, String>) -> RepositoryResult<()> {
+    if trace_headers.keys().any(|key| key.trim().is_empty()) {
+        return Err(RepositoryError::Validation(
+            "outbox trace header names must not be blank".to_owned(),
         ));
     }
     Ok(())

@@ -8,6 +8,7 @@ use uuid::Uuid;
 use crate::{
     AppState, Config,
     debug_token::DebugTokenIssuer,
+    nats_connection::connect_nats,
     object_store::S3ObjectStore,
     observability::{ApiMetrics, init_tracing, metrics_router},
     queue::{JetStreamPublisher, OutboxDispatcher, OutboxDispatcherConfig},
@@ -58,9 +59,9 @@ pub async fn run() -> Result<(), BoxError> {
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let outbox_repository = repository.clone();
     let outbox_metrics = metrics.clone();
-    let nats_url = config.nats_url.expose_secret().to_owned();
+    let nats = config.nats.clone();
     let outbox_task = tokio::spawn(async move {
-        run_outbox_supervisor(outbox_repository, nats_url, outbox_metrics, shutdown_rx).await;
+        run_outbox_supervisor(outbox_repository, nats, outbox_metrics, shutdown_rx).await;
     });
 
     let state = AppState {
@@ -139,7 +140,7 @@ async fn shutdown_signal() -> Result<(), BoxError> {
 
 async fn run_outbox_supervisor(
     repository: Repository,
-    nats_url: String,
+    nats: crate::NatsConfig,
     metrics: ApiMetrics,
     mut shutdown: watch::Receiver<bool>,
 ) {
@@ -149,7 +150,7 @@ async fn run_outbox_supervisor(
         if *shutdown.borrow() {
             return;
         }
-        let connect = tokio::time::timeout(NATS_CONNECT_TIMEOUT, async_nats::connect(&nats_url));
+        let connect = tokio::time::timeout(NATS_CONNECT_TIMEOUT, connect_nats(&nats));
         let connection = tokio::select! {
             changed = shutdown.changed() => {
                 if changed.is_err() || *shutdown.borrow() {

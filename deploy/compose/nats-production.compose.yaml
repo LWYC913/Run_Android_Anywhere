@@ -1,0 +1,36 @@
+services:
+  nats:
+    image: nats:2.10.26-alpine
+    command: ["-c", "/etc/nats/nats-server.conf"]
+    restart: unless-stopped
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp
+    ports:
+      - "4222:4222"
+    environment:
+      JS_KEY: ${JS_KEY:?set a high-entropy JetStream encryption key}
+      NATS_API_PUBLIC_NKEY: ${NATS_API_PUBLIC_NKEY:?set the API public user NKey}
+      NATS_SCHEDULER_PUBLIC_NKEY: ${NATS_SCHEDULER_PUBLIC_NKEY:?set the scheduler public user NKey}
+      NATS_WORKER_PUBLIC_NKEY: ${NATS_WORKER_PUBLIC_NKEY:?set the worker public user NKey}
+      NATS_WORKER_REGISTER_SUBJECT: control.workers.${NATS_WORKER_ID:?set an exact wrk_* worker id}.register
+      NATS_WORKER_HEARTBEAT_SUBJECT: control.workers.${NATS_WORKER_ID:?set an exact wrk_* worker id}.heartbeat
+      NATS_WORKER_TRANSITION_SUBJECT: control.jobs.${NATS_WORKER_ID:?set an exact wrk_* worker id}.transition
+      NATS_WORKER_RESULT_SUBJECT: control.jobs.${NATS_WORKER_ID:?set an exact wrk_* worker id}.result
+      NATS_WORKER_DISPATCH_SUBJECT: workers.${NATS_WORKER_ID:?set an exact wrk_* worker id}.dispatch
+      NATS_WORKER_INBOX_SUBJECT: _INBOX.workers.${NATS_WORKER_ID:?set an exact wrk_* worker id}.>
+    volumes:
+      - ./nats-server.production.conf.example:/etc/nats/nats-server.conf:ro
+      - ${NATS_SERVER_CERT_FILE:?set the server certificate path}:/run/secrets/nats-server-cert.pem:ro
+      - ${NATS_SERVER_KEY_FILE:?set the server key path}:/run/secrets/nats-server-key.pem:ro
+      - ${NATS_CLIENT_CA_FILE:?set the client CA path}:/run/secrets/nats-client-ca.pem:ro
+      - nats-jetstream:/data/jetstream
+
+volumes:
+  # Keep this external volume on encrypted storage as defense in depth. The
+  # server configuration also encrypts JetStream records with JS_KEY.
+  nats-jetstream:
+    external: true
+    name: ${NATS_ENCRYPTED_VOLUME:?create and name an encrypted external volume}

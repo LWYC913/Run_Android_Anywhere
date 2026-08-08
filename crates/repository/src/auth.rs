@@ -25,7 +25,7 @@ impl Repository {
 
         let row = sqlx::query_as::<_, ProjectRow>(
             "INSERT INTO projects (id, name, owner) VALUES ($1, $2, $3) \
-             RETURNING id, name, owner, created_at",
+             RETURNING id, name, owner, max_concurrent_jobs, max_outstanding_jobs, created_at",
         )
         .bind(new_id("proj_"))
         .bind(name)
@@ -52,7 +52,7 @@ impl Repository {
         let mut tx = self.pool.begin().await?;
         let project_row = sqlx::query_as::<_, ProjectRow>(
             "INSERT INTO projects (id, name, owner) VALUES ($1, $2, $3) \
-             RETURNING id, name, owner, created_at",
+             RETURNING id, name, owner, max_concurrent_jobs, max_outstanding_jobs, created_at",
         )
         .bind(new_id("proj_"))
         .bind(name)
@@ -82,7 +82,8 @@ impl Repository {
 
     pub async fn get_project(&self, project_id: &ProjectId) -> RepositoryResult<Option<Project>> {
         sqlx::query_as::<_, ProjectRow>(
-            "SELECT id, name, owner, created_at FROM projects WHERE id = $1",
+            "SELECT id, name, owner, max_concurrent_jobs, max_outstanding_jobs, created_at \
+             FROM projects WHERE id = $1",
         )
         .bind(project_id.as_str())
         .fetch_optional(&self.pool)

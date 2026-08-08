@@ -120,6 +120,7 @@ impl Repository {
         .await?;
 
         let mut extended = Vec::new();
+        let mut cancel_requested = Vec::new();
         let mut rejected = Vec::new();
         for extension in heartbeat.lease_extends {
             let updated = sqlx::query(
@@ -127,6 +128,7 @@ impl Repository {
                  last_lease_extended_at = $4 \
                  WHERE id = $1 AND worker_id = $2 AND lease_id = $3 \
                  AND lease_expires_at > $4 \
+                 AND pending_outcome IS NULL \
                  AND state NOT IN ('queued','passed','failed','cancelled','timed_out','infra_failed')",
             )
             .bind(extension.job_id.as_str())
@@ -139,13 +141,28 @@ impl Repository {
             if updated.rows_affected() == 1 {
                 extended.push(extension);
             } else {
-                rejected.push(extension);
+                let cancellation: bool = sqlx::query_scalar(
+                    "SELECT EXISTS (SELECT 1 FROM jobs WHERE id = $1 AND worker_id = $2 \
+                     AND lease_id = $3 AND pending_outcome = 'cancelled' \
+                     AND state NOT IN ('passed','failed','cancelled','timed_out','infra_failed'))",
+                )
+                .bind(extension.job_id.as_str())
+                .bind(heartbeat.worker_id.as_str())
+                .bind(extension.lease_id.as_str())
+                .fetch_one(&mut *tx)
+                .await?;
+                if cancellation {
+                    cancel_requested.push(extension);
+                } else {
+                    rejected.push(extension);
+                }
             }
         }
         tx.commit().await?;
         Ok(HeartbeatReceipt {
             recorded_at,
             extended,
+            cancel_requested,
             rejected,
         })
     }
@@ -262,7 +279,8 @@ impl Repository {
              FROM workers WHERE state = 'online' AND active_jobs < capacity \
              AND last_heartbeat_at >= $1 AND $2 = ANY(runtimes) AND arch = $3 \
              AND (NOT $4 OR kvm) \
-             ORDER BY active_jobs ASC, last_heartbeat_at DESC, id LIMIT $5",
+             ORDER BY (active_jobs::NUMERIC / capacity::NUMERIC) ASC, active_jobs ASC, \
+             last_heartbeat_at DESC, id LIMIT $5",
         )
         .bind(heartbeat_cutoff)
         .bind(runtime)

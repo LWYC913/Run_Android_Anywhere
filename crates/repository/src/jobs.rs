@@ -3,20 +3,22 @@ use std::collections::BTreeMap;
 use chrono::{DateTime, Duration, Utc};
 use run_anywhere_contracts::{
     AndroidAbi, ArtifactKind, CreateJobRequest, ErrorCode, FailureDetail, HostArch, IsolationTier,
-    Job, JobClaim, JobEvent, JobId, JobOutcome, JobPage, JobQueued, JobResult, JobState, LeaseId,
-    ProjectId, RuntimeKind, RuntimeProfile, Sha256, TransitionEvidence, UploadKind, WorkerId,
-    validate_transition,
+    Job, JobClaim, JobDeadLetter, JobDeadLetterReason, JobEvent, JobId, JobOutcome, JobPage,
+    JobQueued, JobResult, JobState, LeaseId, ProjectId, RuntimeKind, RuntimeProfile, Sha256,
+    TransitionEvidence, UploadKind, WorkerId, validate_transition,
 };
 use serde_json::{Value, json};
 use sqlx::{Postgres, QueryBuilder};
 
 use crate::{
-    ArtifactCursor, CreatedJob, JobCursor, JobListQuery, JobMutation, LeaseGuard,
-    RecoveryDisposition, Repository, RepositoryError, RepositoryResult, StaleJob, StaleJobCriteria,
-    StoredArtifact, StoredArtifactPage, WebhookOutboxPayload,
+    ArtifactCursor, ClaimJobOptions, CreatedJob, JobCursor, JobListQuery, JobMutation,
+    JobSchedulingSnapshot, LeaseGuard, ProjectQuota, RecoveryDisposition, Repository,
+    RepositoryError, RepositoryResult, StaleJob, StaleJobCriteria, StoredArtifact,
+    StoredArtifactPage, WebhookOutboxPayload,
     auth::new_id,
-    codec::{checked_i64, decode_enum, encode_enum, encode_json, to_u32},
+    codec::{checked_i64, decode_enum, encode_enum, encode_json, to_u32, to_u64},
     models::{CONTROL_PLANE_PAGE_SIZE, decode_route_cursor, encode_route_cursor},
+    outbox::insert_job_dead_letter_outbox,
     rows::{ArtifactRow, JobEventRow, JobRow, RuntimeProfileRow, WebhookRow, WorkerRow},
 };
 
@@ -72,6 +74,33 @@ impl Repository {
                 job: row.into_job()?,
                 was_created: false,
                 queued_event: None,
+            });
+        }
+
+        // Different idempotency keys for the same project serialize here. The
+        // replay check above deliberately happens first so a retry still returns
+        // its original job when the project is currently full.
+        let max_outstanding_jobs: Option<i64> = sqlx::query_scalar(
+            "SELECT max_outstanding_jobs FROM projects WHERE id = $1 FOR UPDATE",
+        )
+        .bind(request.project_id.as_str())
+        .fetch_optional(&mut *tx)
+        .await?;
+        let max_outstanding_jobs = max_outstanding_jobs
+            .ok_or_else(|| RepositoryError::not_found("project", request.project_id.as_str()))?;
+        let outstanding_jobs: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM jobs WHERE project_id = $1 \
+             AND state NOT IN ('passed','failed','cancelled','timed_out','infra_failed')",
+        )
+        .bind(request.project_id.as_str())
+        .fetch_one(&mut *tx)
+        .await?;
+        if outstanding_jobs >= max_outstanding_jobs {
+            return Err(RepositoryError::QuotaExceeded {
+                project_id: request.project_id.to_string(),
+                quota: ProjectQuota::OutstandingJobs,
+                current: to_u32("project outstanding jobs", outstanding_jobs)?,
+                limit: to_u32("projects.max_outstanding_jobs", max_outstanding_jobs)?,
             });
         }
 
@@ -151,7 +180,7 @@ impl Repository {
                 job_id: JobId::new(row.id.clone())
                     .map_err(|error| RepositoryError::decode("jobs.id", error))?,
                 project_id: request.project_id.clone(),
-                runtime_profile: profile,
+                runtime_profile_id: profile.id,
                 min_isolation: request.min_isolation,
                 timeout_seconds: request.timeout_seconds,
             };
@@ -207,6 +236,80 @@ impl Repository {
             .await?
             .map(JobRow::into_job)
             .transpose()
+    }
+
+    /// Read the canonical scheduling payload and current lease fencing state.
+    /// Queue consumers use this instead of trusting a potentially stale or
+    /// malformed delivery as the source of truth.
+    pub async fn get_job_scheduling_snapshot(
+        &self,
+        job_id: &JobId,
+    ) -> RepositoryResult<Option<JobSchedulingSnapshot>> {
+        let query = format!("SELECT {JOB_COLUMNS} FROM jobs WHERE id = $1");
+        let Some(row) = sqlx::query_as::<_, JobRow>(&query)
+            .bind(job_id.as_str())
+            .fetch_optional(&self.pool)
+            .await?
+        else {
+            return Ok(None);
+        };
+        let profile_query = format!("SELECT {PROFILE_COLUMNS} FROM runtime_profiles WHERE id = $1");
+        let profile: RuntimeProfile = sqlx::query_as::<_, RuntimeProfileRow>(&profile_query)
+            .bind(&row.runtime_profile_id)
+            .fetch_optional(&self.pool)
+            .await?
+            .ok_or_else(|| RepositoryError::not_found("runtime profile", &row.runtime_profile_id))?
+            .try_into()?;
+        let lease = match (row.worker_id.as_deref(), row.lease_id.as_deref()) {
+            (Some(worker_id), Some(lease_id)) => Some(LeaseGuard {
+                worker_id: WorkerId::new(worker_id.to_owned())
+                    .map_err(|error| RepositoryError::decode("jobs.worker_id", error))?,
+                lease_id: LeaseId::new(lease_id.to_owned())
+                    .map_err(|error| RepositoryError::decode("jobs.lease_id", error))?,
+            }),
+            (None, None) | (Some(_), None) => None,
+            (None, Some(_)) => {
+                return Err(RepositoryError::decode(
+                    "jobs.lease_id",
+                    "lease is present without an owning worker",
+                ));
+            }
+        };
+        let queued = JobQueued {
+            job_id: JobId::new(row.id.clone())
+                .map_err(|error| RepositoryError::decode("jobs.id", error))?,
+            project_id: ProjectId::new(row.project_id.clone())
+                .map_err(|error| RepositoryError::decode("jobs.project_id", error))?,
+            runtime_profile_id: profile.id.clone(),
+            min_isolation: decode_enum("jobs.min_isolation", row.min_isolation.clone())?,
+            timeout_seconds: run_anywhere_contracts::DurationSeconds::new(to_u64(
+                "jobs.timeout_seconds",
+                row.timeout_seconds,
+            )?)
+            .map_err(|error| RepositoryError::decode("jobs.timeout_seconds", error))?,
+        };
+        let lease_expires_at = row.lease_expires_at;
+        let last_lease_extended_at = row.last_lease_extended_at;
+        let delivery_attempts = to_u32("jobs.delivery_attempts", row.delivery_attempts)?;
+        let pending_outcome = row
+            .pending_outcome
+            .clone()
+            .map(|value| decode_enum("jobs.pending_outcome", value))
+            .transpose()?;
+        let artifacts_finalized = row.artifacts_finalized;
+        let cleanup_completed = row.cleanup_completed;
+        Ok(Some(JobSchedulingSnapshot {
+            job: row.into_job()?,
+            queued,
+            runtime_profile: profile,
+            lease,
+            lease_expires_at,
+            last_lease_extended_at,
+            delivery_attempts,
+            pending_outcome,
+            artifacts_finalized,
+            cleanup_completed,
+        }))
     }
 
     /// Request cancellation at the existing artifact-finalization boundary.
@@ -324,6 +427,29 @@ impl Repository {
         lease_id: &LeaseId,
         lease_expires_at: DateTime<Utc>,
     ) -> RepositoryResult<JobClaim> {
+        self.claim_job_with_options(
+            job_id,
+            worker_id,
+            lease_id,
+            lease_expires_at,
+            ClaimJobOptions::default(),
+        )
+        .await
+    }
+
+    pub async fn claim_job_with_options(
+        &self,
+        job_id: &JobId,
+        worker_id: &WorkerId,
+        lease_id: &LeaseId,
+        lease_expires_at: DateTime<Utc>,
+        options: ClaimJobOptions,
+    ) -> RepositoryResult<JobClaim> {
+        if options.worker_stale_after <= Duration::zero() {
+            return Err(RepositoryError::Validation(
+                "worker freshness duration must be positive".to_owned(),
+            ));
+        }
         let mut tx = self.pool.begin().await?;
         let job = lock_job(&mut tx, job_id.as_str())
             .await?
@@ -333,6 +459,28 @@ impl Repository {
             return Err(RepositoryError::CompareAndSwapLost {
                 entity: "job",
                 id: job_id.to_string(),
+            });
+        }
+        let max_concurrent_jobs: Option<i64> =
+            sqlx::query_scalar("SELECT max_concurrent_jobs FROM projects WHERE id = $1 FOR UPDATE")
+                .bind(&job.project_id)
+                .fetch_optional(&mut *tx)
+                .await?;
+        let max_concurrent_jobs = max_concurrent_jobs
+            .ok_or_else(|| RepositoryError::not_found("project", &job.project_id))?;
+        let active_project_jobs: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM jobs WHERE project_id = $1 AND lease_id IS NOT NULL \
+             AND state NOT IN ('passed','failed','cancelled','timed_out','infra_failed')",
+        )
+        .bind(&job.project_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        if active_project_jobs >= max_concurrent_jobs {
+            return Err(RepositoryError::QuotaExceeded {
+                project_id: job.project_id.clone(),
+                quota: ProjectQuota::ConcurrentJobs,
+                current: to_u32("project active jobs", active_project_jobs)?,
+                limit: to_u32("projects.max_concurrent_jobs", max_concurrent_jobs)?,
             });
         }
         let worker = lock_worker(&mut tx, worker_id.as_str())
@@ -352,7 +500,13 @@ impl Repository {
                 "lease expiry must be later than database time".to_owned(),
             ));
         }
-        validate_worker_match(&worker, &profile, minimum, claimed_at)?;
+        validate_worker_match(
+            &worker,
+            &profile,
+            minimum,
+            claimed_at,
+            options.worker_stale_after,
+        )?;
 
         let reserved = sqlx::query(
             "UPDATE workers SET active_jobs = active_jobs + 1, updated_at = now() \
@@ -640,8 +794,15 @@ impl Repository {
             return Ok(RecoveryDisposition::LostRace);
         }
 
-        let requeue = stale.delivery_attempts < max_deliver;
-        let failure = if requeue {
+        let cancelling = current
+            .pending_outcome
+            .as_ref()
+            .map(|value| decode_enum("jobs.pending_outcome", value.clone()))
+            .transpose()?
+            == Some(JobOutcome::Cancelled);
+        let requeue = !cancelling && stale.delivery_attempts < max_deliver;
+        let exhausted = !requeue && !cancelling;
+        let failure = if !exhausted {
             None
         } else {
             Some(encode_json(
@@ -657,6 +818,17 @@ impl Repository {
                 "UPDATE jobs SET state = 'queued', worker_id = NULL, lease_id = NULL, \
                  lease_expires_at = NULL, last_lease_extended_at = NULL, pending_outcome = NULL, \
                  outcome = NULL, failure = NULL, artifacts_finalized = FALSE, cleanup_completed = FALSE \
+                 WHERE id = $1 AND worker_id = $2 AND lease_id = $3 \
+                 AND lease_expires_at = $4 AND state = $5 AND delivery_attempts = $6 \
+                 RETURNING {JOB_COLUMNS}"
+            )
+        } else if cancelling {
+            format!(
+                "UPDATE jobs SET state = CASE WHEN state = 'cleaning_up' THEN state ELSE 'collecting_artifacts' END, \
+                 worker_id = NULL, lease_id = NULL, lease_expires_at = NULL, \
+                 last_lease_extended_at = NULL, pending_outcome = 'cancelled', outcome = NULL, \
+                 failure = NULL, artifacts_finalized = CASE WHEN state = 'cleaning_up' THEN artifacts_finalized ELSE FALSE END, \
+                 cleanup_completed = CASE WHEN state = 'cleaning_up' THEN cleanup_completed ELSE FALSE END \
                  WHERE id = $1 AND worker_id = $2 AND lease_id = $3 \
                  AND lease_expires_at = $4 AND state = $5 AND delivery_attempts = $6 \
                  RETURNING {JOB_COLUMNS}"
@@ -680,7 +852,7 @@ impl Repository {
             .bind(stale.lease_expires_at)
             .bind(encode_enum(stale.state)?)
             .bind(i64::from(stale.delivery_attempts));
-        if !requeue {
+        if exhausted {
             query = query.bind(failure);
         }
         let Some(row) = query.fetch_optional(&mut *tx).await? else {
@@ -700,6 +872,8 @@ impl Repository {
             stale.job_id.as_str(),
             if requeue {
                 "job.recovered_requeued"
+            } else if cancelling {
+                "job.recovery_cancelled"
             } else {
                 "job.recovery_exhausted"
             },
@@ -715,10 +889,30 @@ impl Repository {
             ]),
         )
         .await?;
+        if exhausted {
+            let dead_lettered_at: DateTime<Utc> = sqlx::query_scalar("SELECT clock_timestamp()")
+                .fetch_one(&mut *tx)
+                .await?;
+            let dead_letter = JobDeadLetter::new(
+                Some(stale.job_id.clone()),
+                Some(
+                    ProjectId::new(current.project_id.clone())
+                        .map_err(|error| RepositoryError::decode("jobs.project_id", error))?,
+                ),
+                None,
+                stale.delivery_attempts,
+                JobDeadLetterReason::AttemptsExhausted,
+                dead_lettered_at,
+            )
+            .map_err(|error| RepositoryError::Validation(error.to_string()))?;
+            insert_job_dead_letter_outbox(&mut tx, &dead_letter, BTreeMap::new()).await?;
+        }
         tx.commit().await?;
         let job = row.into_job()?;
         Ok(if requeue {
             RecoveryDisposition::Requeued(job)
+        } else if cancelling {
+            RecoveryDisposition::Cancelling(job)
         } else {
             RecoveryDisposition::Finalizing(job)
         })
@@ -1048,6 +1242,7 @@ fn validate_worker_match(
     profile: &RuntimeProfile,
     minimum: IsolationTier,
     database_now: DateTime<Utc>,
+    worker_stale_after: Duration,
 ) -> RepositoryResult<()> {
     if worker.state != "online" {
         return Err(RepositoryError::Conflict("worker is not online".to_owned()));
@@ -1057,7 +1252,12 @@ fn validate_worker_match(
             "worker has no spare capacity".to_owned(),
         ));
     }
-    if worker.last_heartbeat_at < database_now - Duration::seconds(120) {
+    let heartbeat_cutoff = database_now
+        .checked_sub_signed(worker_stale_after)
+        .ok_or_else(|| {
+            RepositoryError::Validation("worker freshness duration is too large".to_owned())
+        })?;
+    if worker.last_heartbeat_at < heartbeat_cutoff {
         return Err(RepositoryError::Conflict(
             "worker heartbeat is stale".to_owned(),
         ));

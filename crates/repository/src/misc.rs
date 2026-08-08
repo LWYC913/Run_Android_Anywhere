@@ -9,8 +9,8 @@ use serde_json::Value;
 use sqlx::Postgres;
 
 use crate::{
-    AuditEntry, CreatedDebugSession, Repository, RepositoryError, RepositoryResult,
-    StoredDebugSession,
+    AuditEntry, CreatedDebugSession, DebugSessionEndReason, EndedDebugSession, Repository,
+    RepositoryError, RepositoryResult, StoredDebugSession,
     auth::new_id,
     codec::{decode_enum, encode_enum, encode_json},
     rows::{AuditRow, DebugSessionRow, WebhookRow},
@@ -108,6 +108,80 @@ impl Repository {
         .into_iter()
         .map(TryInto::try_into)
         .collect()
+    }
+
+    /// End expired sessions and sessions whose owning job is terminal, writing
+    /// one immutable, reasoned audit entry in the same transaction. Concurrent
+    /// reconcilers divide the work with `SKIP LOCKED`; an ended session is never
+    /// selected again, which makes both the state change and audit idempotent.
+    pub async fn end_expired_or_terminal_debug_sessions_with_audit(
+        &self,
+        expired_before: DateTime<Utc>,
+        actor: impl Into<String>,
+        limit: u32,
+    ) -> RepositoryResult<Vec<EndedDebugSession>> {
+        let actor = actor.into();
+        if actor.trim().is_empty() {
+            return Err(RepositoryError::Validation(
+                "debug-session reconciler actor must not be blank".to_owned(),
+            ));
+        }
+        let limit = crate::models::checked_limit(limit)?;
+        let mut tx = self.pool.begin().await?;
+        let candidates = sqlx::query_as::<_, DebugSessionEndCandidate>(
+            "SELECT sessions.id, sessions.expires_at <= $1 AS expired, \
+             jobs.state IN ('passed','failed','cancelled','timed_out','infra_failed') AS job_ended \
+             FROM debug_sessions AS sessions JOIN jobs ON jobs.id = sessions.job_id \
+             WHERE sessions.ended_at IS NULL AND (sessions.expires_at <= $1 OR \
+             jobs.state IN ('passed','failed','cancelled','timed_out','infra_failed')) \
+             ORDER BY sessions.expires_at, sessions.id LIMIT $2 \
+             FOR UPDATE OF sessions SKIP LOCKED",
+        )
+        .bind(expired_before)
+        .bind(limit)
+        .fetch_all(&mut *tx)
+        .await?;
+
+        let mut ended = Vec::with_capacity(candidates.len());
+        for candidate in candidates {
+            let reason = if candidate.expired {
+                DebugSessionEndReason::Expired
+            } else {
+                debug_assert!(candidate.job_ended);
+                DebugSessionEndReason::JobEnded
+            };
+            let row = sqlx::query_as::<_, DebugSessionRow>(
+                "UPDATE debug_sessions SET ended_at = GREATEST(created_at, clock_timestamp()) \
+                 WHERE id = $1 AND ended_at IS NULL \
+                 RETURNING id, job_id, jti, created_by, mode, created_at, expires_at, ended_at",
+            )
+            .bind(&candidate.id)
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or_else(|| RepositoryError::CompareAndSwapLost {
+                entity: "debug session",
+                id: candidate.id.clone(),
+            })?;
+            let session: StoredDebugSession = row.try_into()?;
+            let audit = insert_audit(
+                &mut tx,
+                &actor,
+                "debug_session.ended",
+                session.id.as_str(),
+                BTreeMap::from([
+                    ("job_id".to_owned(), serde_json::json!(session.job_id)),
+                    ("reason".to_owned(), serde_json::json!(reason.as_str())),
+                ]),
+            )
+            .await?;
+            ended.push(EndedDebugSession {
+                session,
+                audit,
+                reason,
+            });
+        }
+        tx.commit().await?;
+        Ok(ended)
     }
 
     pub async fn append_audit(
@@ -213,6 +287,13 @@ impl Repository {
         .ok_or_else(|| RepositoryError::not_found("webhook", webhook_id.as_str()))?;
         row.try_into()
     }
+}
+
+#[derive(Debug, sqlx::FromRow)]
+struct DebugSessionEndCandidate {
+    id: String,
+    expired: bool,
+    job_ended: bool,
 }
 
 fn validate_debug_session(jti: &str, created_by: &str) -> RepositoryResult<()> {

@@ -1,7 +1,30 @@
 use run_anywhere_contracts::TransitionError;
+use std::fmt;
 use thiserror::Error;
 
 pub type RepositoryResult<T> = Result<T, RepositoryError>;
+
+/// Identifies the project quota that rejected an otherwise valid operation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProjectQuota {
+    OutstandingJobs,
+    ConcurrentJobs,
+}
+
+impl ProjectQuota {
+    pub const fn field_name(self) -> &'static str {
+        match self {
+            Self::OutstandingJobs => "max_outstanding_jobs",
+            Self::ConcurrentJobs => "max_concurrent_jobs",
+        }
+    }
+}
+
+impl fmt::Display for ProjectQuota {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.field_name())
+    }
+}
 
 #[derive(Debug, Error)]
 pub enum RepositoryError {
@@ -11,6 +34,13 @@ pub enum RepositoryError {
     NotFound { entity: &'static str, id: String },
     #[error("conflict: {0}")]
     Conflict(String),
+    #[error("project `{project_id}` reached its {quota} quota ({current}/{limit})")]
+    QuotaExceeded {
+        project_id: String,
+        quota: ProjectQuota,
+        current: u32,
+        limit: u32,
+    },
     #[error(transparent)]
     InvalidTransition(#[from] TransitionError),
     #[error("compare-and-swap lost while updating {entity} `{id}`")]

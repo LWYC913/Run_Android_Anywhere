@@ -2608,7 +2608,25 @@ dependencies = [
 name = "run-anywhere-scheduler"
 version = "0.1.0"
 dependencies = [
+ "async-nats",
+ "async-trait",
+ "axum",
+ "chrono",
+ "futures-util",
+ "http-body-util",
+ "reqwest",
  "run-anywhere-contracts",
+ "run-anywhere-repository",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "thiserror 2.0.18",
+ "tokio",
+ "tower",
+ "tracing",
+ "tracing-subscriber",
+ "url",
+ "uuid",
 ]
 
 [[package]]
