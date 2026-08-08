@@ -5,10 +5,16 @@
 //! leaking credentials or signing material.
 
 use std::{
-    collections::HashMap, env, fmt, fs, net::SocketAddr, path::Path, str::FromStr, time::Duration,
+    collections::HashMap,
+    env, fmt, fs,
+    net::{IpAddr, SocketAddr},
+    path::{Path, PathBuf},
+    str::FromStr,
+    time::Duration,
 };
 
 use thiserror::Error;
+use url::{Host, Url};
 
 const DEFAULT_DATABASE_URL: &str = "postgres://postgres:postgres@127.0.0.1:5432/run_anywhere_dev";
 const DEFAULT_NATS_URL: &str = "nats://127.0.0.1:4222";
@@ -54,6 +60,19 @@ pub struct S3Config {
     pub force_path_style: bool,
 }
 
+/// Authenticated, TLS-aware NATS client settings for the API producer.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NatsConfig {
+    pub url: SecretString,
+    /// A NATS `.creds` file containing the API user's JWT and NKey seed.
+    pub credentials_file: Option<PathBuf>,
+    /// A raw NKey seed file for operator-managed API identities.
+    pub nkey_seed_file: Option<PathBuf>,
+    pub tls_ca_file: Option<PathBuf>,
+    pub tls_client_cert_file: Option<PathBuf>,
+    pub tls_client_key_file: Option<PathBuf>,
+}
+
 /// Complete control-plane process configuration.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Config {
@@ -65,7 +84,7 @@ pub struct Config {
     pub metrics_bind_addr: SocketAddr,
     pub database_url: SecretString,
     pub bootstrap_admin_token: Option<SecretString>,
-    pub nats_url: SecretString,
+    pub nats: NatsConfig,
     pub s3: S3Config,
     /// Ed25519 private key encoded as PKCS#8 PEM.
     pub jwt_signing_key: SecretString,
@@ -91,6 +110,18 @@ pub enum ConfigError {
         #[source]
         source: std::io::Error,
     },
+    #[error("remote NATS requires a `tls://` or `wss://` endpoint")]
+    RemoteNatsRequiresTls,
+    #[error(
+        "remote NATS requires NKey/JWT credentials via `NATS_CREDENTIALS_FILE` or `NATS_NKEY_SEED_FILE`"
+    )]
+    RemoteNatsRequiresCredentials,
+    #[error("`NATS_CREDENTIALS_FILE` and `NATS_NKEY_SEED_FILE` are mutually exclusive")]
+    ConflictingNatsCredentials,
+    #[error(
+        "`NATS_TLS_CLIENT_CERT_FILE` and `NATS_TLS_CLIENT_KEY_FILE` must be configured together"
+    )]
+    IncompleteNatsClientCertificate,
 }
 
 impl Config {
@@ -172,12 +203,58 @@ impl Config {
             .to_owned();
         require_http_url("DEBUG_GATEWAY_BASE_URL", &debug_gateway_base_url)?;
 
+        let nats_url = get("NATS_URL").unwrap_or(DEFAULT_NATS_URL);
+        let parsed_nats = Url::parse(nats_url).map_err(|error| ConfigError::Invalid {
+            name: "NATS_URL",
+            message: error.to_string(),
+        })?;
+        if !matches!(parsed_nats.scheme(), "nats" | "tls" | "ws" | "wss")
+            || parsed_nats.host().is_none()
+        {
+            return Err(ConfigError::Invalid {
+                name: "NATS_URL",
+                message: "must be an absolute nats://, tls://, ws://, or wss:// URL".to_owned(),
+            });
+        }
+        if !parsed_nats.username().is_empty() || parsed_nats.password().is_some() {
+            return Err(ConfigError::Invalid {
+                name: "NATS_URL",
+                message: "must not embed credentials; use an NKey/JWT credential file".to_owned(),
+            });
+        }
+
+        let credentials_file = get("NATS_CREDENTIALS_FILE").map(PathBuf::from);
+        let nkey_seed_file = get("NATS_NKEY_SEED_FILE").map(PathBuf::from);
+        if credentials_file.is_some() && nkey_seed_file.is_some() {
+            return Err(ConfigError::ConflictingNatsCredentials);
+        }
+        let local_nats = nats_endpoint_is_loopback(&parsed_nats);
+        if !local_nats && !matches!(parsed_nats.scheme(), "tls" | "wss") {
+            return Err(ConfigError::RemoteNatsRequiresTls);
+        }
+        if !local_nats && credentials_file.is_none() && nkey_seed_file.is_none() {
+            return Err(ConfigError::RemoteNatsRequiresCredentials);
+        }
+
+        let tls_client_cert_file = get("NATS_TLS_CLIENT_CERT_FILE").map(PathBuf::from);
+        let tls_client_key_file = get("NATS_TLS_CLIENT_KEY_FILE").map(PathBuf::from);
+        if tls_client_cert_file.is_some() != tls_client_key_file.is_some() {
+            return Err(ConfigError::IncompleteNatsClientCertificate);
+        }
+
         Ok(Self {
             api_bind_addr,
             metrics_bind_addr,
             database_url: SecretString::new(get("DATABASE_URL").unwrap_or(DEFAULT_DATABASE_URL)),
             bootstrap_admin_token: get("BOOTSTRAP_ADMIN_TOKEN").map(SecretString::new),
-            nats_url: SecretString::new(get("NATS_URL").unwrap_or(DEFAULT_NATS_URL)),
+            nats: NatsConfig {
+                url: SecretString::new(nats_url),
+                credentials_file,
+                nkey_seed_file,
+                tls_ca_file: get("NATS_TLS_CA_FILE").map(PathBuf::from),
+                tls_client_cert_file,
+                tls_client_key_file,
+            },
             s3: S3Config {
                 endpoint: s3_endpoint,
                 region: get("S3_REGION")
@@ -275,6 +352,20 @@ fn require_http_url(name: &'static str, value: &str) -> Result<(), ConfigError> 
     Ok(())
 }
 
+fn nats_endpoint_is_loopback(url: &Url) -> bool {
+    match url.host() {
+        Some(Host::Domain(host)) => {
+            host.eq_ignore_ascii_case("localhost")
+                || host
+                    .parse::<IpAddr>()
+                    .is_ok_and(|address| address.is_loopback())
+        }
+        Some(Host::Ipv4(ip)) => ip.is_loopback(),
+        Some(Host::Ipv6(ip)) => ip.is_loopback(),
+        None => false,
+    }
+}
+
 fn read_secret_file(name: &'static str, path: &Path) -> Result<String, ConfigError> {
     fs::read_to_string(path)
         .map(|value| value.trim().to_owned())
@@ -305,6 +396,7 @@ mod tests {
         assert!(!config.webhook_allow_private_networks);
         assert_eq!(config.debug_token_ttl, Duration::from_secs(900));
         assert!(config.jwt_signing_key.expose_secret().contains('\n'));
+        assert_eq!(config.nats.url.expose_secret(), "nats://127.0.0.1:4222");
     }
 
     #[test]
@@ -333,6 +425,69 @@ mod tests {
                 name: "DEBUG_TOKEN_TTL_SECONDS",
                 ..
             })
+        ));
+    }
+
+    #[test]
+    fn remote_nats_requires_tls_then_credentials() {
+        let mut plaintext = required_values();
+        plaintext.insert(
+            "NATS_URL".to_owned(),
+            "nats://nats.example.test:4222".to_owned(),
+        );
+        assert!(matches!(
+            Config::from_map(plaintext),
+            Err(ConfigError::RemoteNatsRequiresTls)
+        ));
+
+        let mut tls = required_values();
+        tls.insert(
+            "NATS_URL".to_owned(),
+            "tls://nats.example.test:4222".to_owned(),
+        );
+        assert!(matches!(
+            Config::from_map(tls),
+            Err(ConfigError::RemoteNatsRequiresCredentials)
+        ));
+    }
+
+    #[test]
+    fn remote_tls_with_api_credentials_is_valid() {
+        let mut values = required_values();
+        values.insert(
+            "NATS_URL".to_owned(),
+            "tls://nats.example.test:4222".to_owned(),
+        );
+        values.insert(
+            "NATS_CREDENTIALS_FILE".to_owned(),
+            "/run/secrets/api.creds".to_owned(),
+        );
+
+        let config = Config::from_map(values).unwrap();
+        assert_eq!(
+            config.nats.credentials_file,
+            Some(PathBuf::from("/run/secrets/api.creds"))
+        );
+    }
+
+    #[test]
+    fn nats_credentials_and_client_certificate_settings_are_unambiguous() {
+        let mut conflicting = required_values();
+        conflicting.insert("NATS_CREDENTIALS_FILE".to_owned(), "api.creds".to_owned());
+        conflicting.insert("NATS_NKEY_SEED_FILE".to_owned(), "api.seed".to_owned());
+        assert!(matches!(
+            Config::from_map(conflicting),
+            Err(ConfigError::ConflictingNatsCredentials)
+        ));
+
+        let mut incomplete_certificate = required_values();
+        incomplete_certificate.insert(
+            "NATS_TLS_CLIENT_CERT_FILE".to_owned(),
+            "api-cert.pem".to_owned(),
+        );
+        assert!(matches!(
+            Config::from_map(incomplete_certificate),
+            Err(ConfigError::IncompleteNatsClientCertificate)
         ));
     }
 }

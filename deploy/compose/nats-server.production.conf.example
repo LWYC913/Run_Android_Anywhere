@@ -1,0 +1,104 @@
+# Production NATS 2.10 template for Part 04.
+#
+# Only public NKeys belong in this server process. Client seed files remain in
+# the API, scheduler, and worker secret stores. Duplicate the final worker
+# entry for every worker identity, replacing its six subject variables with
+# that worker's exact `wrk_*` namespace. Larger fleets should issue equivalent
+# per-worker permissions in user JWTs through an operator/account resolver.
+
+server_name: run-anywhere-nats
+port: 4222
+http: 127.0.0.1:8222
+
+jetstream {
+  store_dir: "/data/jetstream"
+  max_memory_store: 256MB
+  max_file_store: 16GB
+  cipher: chachapoly
+  # Inject through the process environment or a secret manager. Never commit.
+  key: $JS_KEY
+}
+
+tls {
+  cert_file: "/run/secrets/nats-server-cert.pem"
+  key_file: "/run/secrets/nats-server-key.pem"
+  ca_file: "/run/secrets/nats-client-ca.pem"
+  verify: true
+  timeout: 2
+}
+
+authorization {
+  timeout: 2
+  users: [
+    {
+      nkey: $NATS_API_PUBLIC_NKEY
+      permissions: {
+        publish: { allow: ["jobs.queued"] }
+        subscribe: { allow: ["_INBOX.api.>"] }
+      }
+    }
+    {
+      nkey: $NATS_SCHEDULER_PUBLIC_NKEY
+      permissions: {
+        publish: {
+          allow: [
+            "jobs.queued",
+            "jobs.dead",
+            "workers.*.dispatch",
+            "_INBOX.workers.*.>",
+            "$JS.ACK.JOB_QUEUE.job-dispatch-v1.>",
+            "$JS.ACK.JOB_ADVISORIES.job-advisory-recovery-v1.>",
+            "$JS.API.STREAM.INFO.JOB_QUEUE",
+            "$JS.API.STREAM.CREATE.JOB_QUEUE",
+            "$JS.API.STREAM.UPDATE.JOB_QUEUE",
+            "$JS.API.STREAM.MSG.GET.JOB_QUEUE",
+            "$JS.API.STREAM.MSG.DELETE.JOB_QUEUE",
+            "$JS.API.STREAM.INFO.JOB_DLQ",
+            "$JS.API.STREAM.CREATE.JOB_DLQ",
+            "$JS.API.STREAM.UPDATE.JOB_DLQ",
+            "$JS.API.STREAM.INFO.JOB_ADVISORIES",
+            "$JS.API.STREAM.CREATE.JOB_ADVISORIES",
+            "$JS.API.STREAM.UPDATE.JOB_ADVISORIES",
+            "$JS.API.CONSUMER.INFO.JOB_QUEUE.job-dispatch-v1",
+            "$JS.API.CONSUMER.CREATE.JOB_QUEUE.job-dispatch-v1.jobs.queued",
+            "$JS.API.CONSUMER.MSG.NEXT.JOB_QUEUE.job-dispatch-v1",
+            "$JS.API.CONSUMER.INFO.JOB_ADVISORIES.job-advisory-recovery-v1",
+            "$JS.API.CONSUMER.CREATE.JOB_ADVISORIES.job-advisory-recovery-v1",
+            "$JS.API.CONSUMER.MSG.NEXT.JOB_ADVISORIES.job-advisory-recovery-v1"
+          ]
+        }
+        subscribe: {
+          allow: [
+            "control.workers.*.register",
+            "control.workers.*.heartbeat",
+            "control.jobs.*.transition",
+            "control.jobs.*.result",
+            "$JS.EVENT.ADVISORY.CONSUMER.MAX_DELIVERIES.JOB_QUEUE.job-dispatch-v1",
+            "$JS.EVENT.ADVISORY.CONSUMER.MSG_TERMINATED.JOB_QUEUE.job-dispatch-v1",
+            "_INBOX.scheduler.>"
+          ]
+        }
+      }
+    }
+    {
+      nkey: $NATS_WORKER_PUBLIC_NKEY
+      permissions: {
+        publish: {
+          allow: [
+            $NATS_WORKER_REGISTER_SUBJECT,
+            $NATS_WORKER_HEARTBEAT_SUBJECT,
+            $NATS_WORKER_TRANSITION_SUBJECT,
+            $NATS_WORKER_RESULT_SUBJECT
+          ]
+        }
+        subscribe: {
+          allow: [
+            $NATS_WORKER_DISPATCH_SUBJECT,
+            $NATS_WORKER_INBOX_SUBJECT
+          ]
+        }
+        allow_responses: { max: 1, expires: "30s" }
+      }
+    }
+  ]
+}

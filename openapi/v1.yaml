@@ -47,6 +47,14 @@ x-worker-protocol-schemas:
     $ref: '#/components/schemas/JobLeaseExtension'
   job_result:
     $ref: '#/components/schemas/JobResult'
+  job_dispatch:
+    $ref: '#/components/schemas/JobDispatch'
+  job_state_transition_request:
+    $ref: '#/components/schemas/JobStateTransitionRequest'
+  control_response:
+    $ref: '#/components/schemas/ControlResponse'
+  job_dead_letter:
+    $ref: '#/components/schemas/JobDeadLetter'
 x-state-machine-schemas:
   transition_evidence:
     $ref: '#/components/schemas/TransitionEvidence'
@@ -80,6 +88,8 @@ paths:
                   id: proj_mobile_qa
                   name: Mobile QA
                   owner: bootstrap-admin
+                  max_concurrent_jobs: 2
+                  max_outstanding_jobs: 100
                   created_at: '2026-07-13T08:30:00Z'
                 api_key: ra_live_example_secret
                 scopes: [project:read, project:write, debug:create]
@@ -950,7 +960,7 @@ components:
           maxLength: 255
     Project:
       type: object
-      required: [id, name, owner, created_at]
+      required: [id, name, owner, max_concurrent_jobs, max_outstanding_jobs, created_at]
       properties:
         id:
           $ref: '#/components/schemas/ProjectId'
@@ -958,6 +968,18 @@ components:
           type: string
         owner:
           type: string
+        max_concurrent_jobs:
+          type: integer
+          format: int64
+          minimum: 1
+          default: 2
+          description: Maximum jobs from this project that may hold active worker leases.
+        max_outstanding_jobs:
+          type: integer
+          format: int64
+          minimum: 1
+          default: 100
+          description: Maximum non-terminal jobs that may exist for this project.
         created_at:
           type: string
           format: date-time
@@ -1475,14 +1497,14 @@ components:
           format: date-time
     JobQueued:
       type: object
-      required: [job_id, project_id, runtime_profile, min_isolation, timeout_seconds]
+      required: [job_id, project_id, runtime_profile_id, min_isolation, timeout_seconds]
       properties:
         job_id:
           $ref: '#/components/schemas/JobId'
         project_id:
           $ref: '#/components/schemas/ProjectId'
-        runtime_profile:
-          $ref: '#/components/schemas/RuntimeProfile'
+        runtime_profile_id:
+          $ref: '#/components/schemas/RuntimeProfileId'
         min_isolation:
           $ref: '#/components/schemas/IsolationTier'
         timeout_seconds:
@@ -1574,5 +1596,102 @@ components:
         error:
           $ref: '#/components/schemas/FailureDetail'
         completed_at:
+          type: string
+          format: date-time
+    JobDispatch:
+      type: object
+      required: [claim]
+      properties:
+        claim:
+          $ref: '#/components/schemas/JobClaim'
+        trace_context:
+          type: object
+          additionalProperties:
+            type: string
+          description: Filtered tracing propagation headers; credentials are forbidden.
+    JobStateTransitionRequest:
+      type: object
+      required: [job_id, worker_id, lease_id, from, to, evidence]
+      properties:
+        job_id:
+          $ref: '#/components/schemas/JobId'
+        worker_id:
+          $ref: '#/components/schemas/WorkerId'
+        lease_id:
+          $ref: '#/components/schemas/LeaseId'
+        from:
+          $ref: '#/components/schemas/JobState'
+        to:
+          $ref: '#/components/schemas/JobState'
+        evidence:
+          $ref: '#/components/schemas/TransitionEvidence'
+    ControlDisposition:
+      type: string
+      enum: [accepted, heartbeat, stale_lease, quota_exceeded, retry]
+    ControlResponse:
+      oneOf:
+        - type: object
+          required: [disposition]
+          properties:
+            disposition:
+              const: accepted
+        - type: object
+          required: [disposition, extended, cancel_requested, stale]
+          properties:
+            disposition:
+              const: heartbeat
+            extended:
+              type: array
+              items:
+                $ref: '#/components/schemas/JobLeaseExtension'
+            cancel_requested:
+              type: array
+              items:
+                $ref: '#/components/schemas/JobLeaseExtension'
+            stale:
+              type: array
+              items:
+                $ref: '#/components/schemas/JobLeaseExtension'
+        - type: object
+          required: [disposition]
+          properties:
+            disposition:
+              const: stale_lease
+        - type: object
+          required: [disposition, retry_after_seconds]
+          properties:
+            disposition:
+              const: quota_exceeded
+            retry_after_seconds:
+              $ref: '#/components/schemas/DurationSeconds'
+        - type: object
+          required: [disposition, retry_after_seconds]
+          properties:
+            disposition:
+              const: retry
+            retry_after_seconds:
+              $ref: '#/components/schemas/DurationSeconds'
+    JobDeadLetterReason:
+      type: string
+      enum: [malformed_message, canonical_job_inconsistent, attempts_exhausted]
+    JobDeadLetter:
+      type: object
+      required: [attempt, reason, dead_lettered_at]
+      properties:
+        job_id:
+          $ref: '#/components/schemas/JobId'
+        project_id:
+          $ref: '#/components/schemas/ProjectId'
+        source_stream_sequence:
+          type: integer
+          format: int64
+          minimum: 1
+        attempt:
+          type: integer
+          format: int32
+          minimum: 1
+        reason:
+          $ref: '#/components/schemas/JobDeadLetterReason'
+        dead_lettered_at:
           type: string
           format: date-time

@@ -154,6 +154,16 @@ impl From<RepositoryError> for ApiError {
             RepositoryError::Validation(message) => Self::validation(message),
             RepositoryError::NotFound { entity, .. } => Self::not_found(entity),
             RepositoryError::Conflict(message) => Self::conflict(message),
+            RepositoryError::QuotaExceeded {
+                project_id,
+                quota,
+                current,
+                limit,
+            } => Self::quota_exceeded(format!("project `{project_id}` reached its {quota} quota"))
+                .with_detail("project_id", Value::String(project_id))
+                .with_detail("quota", Value::String(quota.field_name().to_owned()))
+                .with_detail("current", Value::from(current))
+                .with_detail("limit", Value::from(limit)),
             RepositoryError::InvalidTransition(error) => Self::conflict(error.to_string()),
             RepositoryError::CompareAndSwapLost { .. } => {
                 Self::conflict("the resource changed while the request was being processed")
@@ -201,6 +211,16 @@ mod tests {
         assert_eq!(
             ApiError::from(RepositoryError::Conflict("duplicate".to_owned())).code(),
             ErrorCode::Conflict
+        );
+        assert_eq!(
+            ApiError::from(RepositoryError::QuotaExceeded {
+                project_id: "proj_test".to_owned(),
+                quota: run_anywhere_repository::ProjectQuota::OutstandingJobs,
+                current: 100,
+                limit: 100,
+            })
+            .code(),
+            ErrorCode::QuotaExceeded
         );
     }
 

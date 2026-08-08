@@ -4,7 +4,8 @@ use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use chrono::{DateTime, Utc};
 use run_anywhere_contracts::{
     Artifact, AuthScope, DebugSessionId, DebugSessionMode, Job, JobEvent, JobId, JobLeaseExtension,
-    JobState, LeaseId, Project, ProjectId, Sha256, UploadId, UploadKind, Uri, WebhookId, WorkerId,
+    JobOutcome, JobQueued, JobState, LeaseId, Project, ProjectId, RuntimeProfile, Sha256, UploadId,
+    UploadKind, Uri, WebhookId, WorkerId,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -224,10 +225,65 @@ pub struct LeaseGuard {
     pub lease_id: LeaseId,
 }
 
+/// Canonical database state used to validate and safely rebind queue deliveries.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct JobSchedulingSnapshot {
+    pub job: Job,
+    pub queued: JobQueued,
+    /// Full canonical profile used for matching; never copied into JobQueued.
+    pub runtime_profile: RuntimeProfile,
+    pub lease: Option<LeaseGuard>,
+    pub lease_expires_at: Option<DateTime<Utc>>,
+    pub last_lease_extended_at: Option<DateTime<Utc>>,
+    pub delivery_attempts: u32,
+    pub pending_outcome: Option<JobOutcome>,
+    pub artifacts_finalized: bool,
+    pub cleanup_completed: bool,
+}
+
+/// Atomic-claim policy supplied by the scheduler's validated configuration.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ClaimJobOptions {
+    pub worker_stale_after: chrono::Duration,
+}
+
+impl Default for ClaimJobOptions {
+    fn default() -> Self {
+        Self {
+            // The standalone scheduler passes its validated setting explicitly;
+            // this default keeps compatibility for simpler callers.
+            worker_stale_after: chrono::Duration::seconds(45),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DebugSessionEndReason {
+    Expired,
+    JobEnded,
+}
+
+impl DebugSessionEndReason {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Expired => "expired",
+            Self::JobEnded => "job_ended",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EndedDebugSession {
+    pub session: StoredDebugSession,
+    pub audit: AuditEntry,
+    pub reason: DebugSessionEndReason,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HeartbeatReceipt {
     pub recorded_at: DateTime<Utc>,
     pub extended: Vec<JobLeaseExtension>,
+    pub cancel_requested: Vec<JobLeaseExtension>,
     pub rejected: Vec<JobLeaseExtension>,
 }
 
@@ -254,6 +310,7 @@ pub struct StaleJob {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RecoveryDisposition {
     Requeued(Job),
+    Cancelling(Job),
     Finalizing(Job),
     LostRace,
 }

@@ -21,6 +21,8 @@ pub(crate) struct ProjectRow {
     pub id: String,
     pub name: String,
     pub owner: String,
+    pub max_concurrent_jobs: i64,
+    pub max_outstanding_jobs: i64,
     pub created_at: DateTime<Utc>,
 }
 
@@ -33,6 +35,11 @@ impl TryFrom<ProjectRow> for Project {
                 .map_err(|error| RepositoryError::decode("projects.id", error))?,
             name: row.name,
             owner: row.owner,
+            max_concurrent_jobs: to_u32("projects.max_concurrent_jobs", row.max_concurrent_jobs)?,
+            max_outstanding_jobs: to_u32(
+                "projects.max_outstanding_jobs",
+                row.max_outstanding_jobs,
+            )?,
             created_at: row.created_at,
         })
     }
@@ -154,8 +161,10 @@ pub(crate) struct JobRow {
     pub outcome: Option<String>,
     pub failure: Option<Value>,
     pub artifacts_finalized: bool,
+    pub cleanup_completed: bool,
     pub lease_id: Option<String>,
     pub lease_expires_at: Option<DateTime<Utc>>,
+    pub last_lease_extended_at: Option<DateTime<Utc>>,
     pub delivery_attempts: i64,
     pub created_at: DateTime<Utc>,
     pub started_at: Option<DateTime<Utc>>,

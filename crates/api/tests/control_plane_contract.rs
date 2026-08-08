@@ -30,7 +30,11 @@ fn environment_contract_uses_safe_defaults_and_redacts_secrets() {
     );
     values.insert(
         "NATS_URL".to_owned(),
-        "nats://queue.example.test:4222".to_owned(),
+        "tls://queue.example.test:4222".to_owned(),
+    );
+    values.insert(
+        "NATS_CREDENTIALS_FILE".to_owned(),
+        "/run/secrets/api.creds".to_owned(),
     );
     values.insert(
         "S3_ENDPOINT".to_owned(),

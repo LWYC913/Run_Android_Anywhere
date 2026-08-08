@@ -64,11 +64,28 @@ pub struct CreateProjectRequest {
     pub name: String,
 }
 
+pub const DEFAULT_PROJECT_MAX_CONCURRENT_JOBS: u32 = 2;
+pub const DEFAULT_PROJECT_MAX_OUTSTANDING_JOBS: u32 = 100;
+
+const fn default_project_max_concurrent_jobs() -> u32 {
+    DEFAULT_PROJECT_MAX_CONCURRENT_JOBS
+}
+
+const fn default_project_max_outstanding_jobs() -> u32 {
+    DEFAULT_PROJECT_MAX_OUTSTANDING_JOBS
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct Project {
     pub id: ProjectId,
     pub name: String,
     pub owner: String,
+    #[serde(default = "default_project_max_concurrent_jobs")]
+    #[schema(value_type = u64, minimum = 1, required)]
+    pub max_concurrent_jobs: u32,
+    #[serde(default = "default_project_max_outstanding_jobs")]
+    #[schema(value_type = u64, minimum = 1, required)]
+    pub max_outstanding_jobs: u32,
     pub created_at: DateTime<Utc>,
 }
 
@@ -380,5 +397,28 @@ mod tests {
         assert_eq!(concrete.next_cursor.as_deref(), Some("next"));
         let generic = Page::<Artifact>::from(concrete);
         assert!(generic.items.is_empty());
+    }
+
+    #[test]
+    fn project_quota_defaults_preserve_older_wire_payloads() {
+        let project: Project = serde_json::from_value(serde_json::json!({
+            "id": "proj_demo",
+            "name": "Demo",
+            "owner": "owner@example.test",
+            "created_at": "2026-07-13T00:00:00Z"
+        }))
+        .unwrap();
+
+        assert_eq!(
+            project.max_concurrent_jobs,
+            DEFAULT_PROJECT_MAX_CONCURRENT_JOBS
+        );
+        assert_eq!(
+            project.max_outstanding_jobs,
+            DEFAULT_PROJECT_MAX_OUTSTANDING_JOBS
+        );
+        let serialized = serde_json::to_value(project).unwrap();
+        assert_eq!(serialized["max_concurrent_jobs"], 2);
+        assert_eq!(serialized["max_outstanding_jobs"], 100);
     }
 }

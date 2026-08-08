@@ -16,6 +16,7 @@ jobs:
       BOOTSTRAP_ADMIN_TOKEN: ci-bootstrap-admin-token
       NATS_URL: nats://127.0.0.1:4222
       NATS_MONITOR_PORT: "8222"
+      NATS_SECURITY_URL: nats://127.0.0.1:4223
       S3_ENDPOINT: http://127.0.0.1:9000
       S3_REGION: us-east-1
       S3_BUCKET: run-anywhere
@@ -24,6 +25,17 @@ jobs:
       S3_FORCE_PATH_STYLE: "true"
       RUN_OBJECT_STORE_INTEGRATION: "true"
       RUN_QUEUE_INTEGRATION: "true"
+      RUN_SCHEDULER_INTEGRATION: "true"
+      RUN_NATS_SECURITY_INTEGRATION: "true"
+      SCHEDULER_METRICS_BIND_ADDR: 127.0.0.1:9091
+      SCHEDULER_STREAM_REPLICAS: "1"
+      SCHEDULER_WORKER_HEARTBEAT_SECONDS: "15"
+      SCHEDULER_STALE_WORKER_SECONDS: "45"
+      SCHEDULER_ACK_WAIT_SECONDS: "60"
+      SCHEDULER_DATABASE_LEASE_SECONDS: "75"
+      SCHEDULER_MAX_RUN_ATTEMPTS: "3"
+      SCHEDULER_RECONCILE_INTERVAL_SECONDS: "10"
+      SCHEDULER_REAP_GRACE_SECONDS: "120"
       AWS_ACCESS_KEY_ID: minioadmin
       AWS_SECRET_ACCESS_KEY: minioadmin
       AWS_EC2_METADATA_DISABLED: "true"
@@ -52,7 +64,11 @@ jobs:
 
       - name: Start NATS JetStream and MinIO
         run: |
-          docker run --detach --name raa-nats --publish 4222:4222 --publish 8222:8222 nats:2.10-alpine -js -m 8222
+          docker run --detach --name raa-nats --publish 4222:4222 --publish 8222:8222 nats:2.10.26-alpine -js -m 8222
+          docker run --detach --name raa-nats-security \
+            --publish 4223:4223 --publish 8223:8223 \
+            --volume "$PWD/crates/scheduler/tests/fixtures/nats-security.conf:/etc/nats/nats-server.conf:ro" \
+            nats:2.10.26-alpine -c /etc/nats/nats-server.conf
           docker run --detach --name raa-minio --publish 9000:9000 --publish 9001:9001 \
             --env MINIO_ROOT_USER="$S3_ACCESS_KEY_ID" \
             --env MINIO_ROOT_PASSWORD="$S3_SECRET_ACCESS_KEY" \
@@ -62,11 +78,13 @@ jobs:
         run: |
           for attempt in {1..30}; do
             if curl --fail --silent http://127.0.0.1:8222/jsz >/dev/null && \
+               curl --fail --silent http://127.0.0.1:8223/jsz >/dev/null && \
                curl --fail --silent http://127.0.0.1:9000/minio/health/live >/dev/null; then
               break
             fi
             if [ "$attempt" -eq 30 ]; then
               docker logs raa-nats
+              docker logs raa-nats-security
               docker logs raa-minio
               exit 1
             fi

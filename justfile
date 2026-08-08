@@ -49,6 +49,24 @@ api-integration-test: infra-check
 
 api-check: api-test openapi-lint contract-check
 
+scheduler-build:
+    cargo build -p run-anywhere-scheduler --all-targets --all-features --locked
+
+scheduler-test:
+    cargo test -p run-anywhere-scheduler --all-features --locked
+
+# Run scheduler tests that exercise the pinned JetStream and PostgreSQL
+# services after verifying that both dependencies are reachable.
+scheduler-integration-test: infra-check db-migrate
+    node -e "const {spawnSync}=require('node:child_process'); const result=spawnSync('cargo',['test','-p','run-anywhere-scheduler','--all-features','--locked'],{stdio:'inherit',env:{...process.env,RUN_SCHEDULER_INTEGRATION:'true'}}); if(result.error) throw result.error; process.exit(result.status ?? 1);"
+
+# Opt-in Docker Engine cleanup probe. Set SCHEDULER_DOCKER_TEST_IMAGE to an
+# image that is already present in the target Docker daemon.
+scheduler-docker-integration-test:
+    node -e "const {spawnSync}=require('node:child_process'); const result=spawnSync('cargo',['test','-p','run-anywhere-scheduler','--all-features','--locked','reaper::tests::docker_engine_reaper_removes_an_exactly_fenced_container','--','--exact'],{stdio:'inherit',env:{...process.env,RUN_DOCKER_REAPER_INTEGRATION:'true'}}); if(result.error) throw result.error; process.exit(result.status ?? 1);"
+
+scheduler-check: scheduler-test scheduler-build
+
 # Verify the local Part 3 dependencies without mutating them. NATS monitoring
 # must be available on port 8222 so this also proves JetStream is enabled.
 infra-check:
@@ -61,6 +79,9 @@ dev-jwt-key:
 
 api-run: infra-check db-migrate
     cargo run -p run-anywhere-api --locked
+
+scheduler-run: infra-check db-migrate
+    cargo run -p run-anywhere-scheduler --locked
 
 msrv:
     rustup run 1.85.0 cargo test --workspace --all-features --locked

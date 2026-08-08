@@ -3,8 +3,7 @@ use std::{collections::BTreeMap, env, time::Duration};
 use async_nats::jetstream::stream;
 use run_anywhere_api::queue::{JetStreamPublisher, JobQueuePublisher};
 use run_anywhere_contracts::{
-    AndroidAbi, DurationSeconds, HostArch, IsolationTier, JobId, JobQueued, ProjectId, RuntimeKind,
-    RuntimeProfile, RuntimeProfileId,
+    DurationSeconds, IsolationTier, JobId, JobQueued, ProjectId, RuntimeProfileId,
 };
 use uuid::Uuid;
 
@@ -34,16 +33,7 @@ async fn jetstream_publisher_uses_the_job_id_for_deduplication() -> TestResult {
     let message = JobQueued {
         job_id: JobId::new(format!("job_{suffix}"))?,
         project_id: ProjectId::new("proj_queue_integration")?,
-        runtime_profile: RuntimeProfile {
-            id: RuntimeProfileId::new("rtp_queue_integration")?,
-            android_api: 35,
-            device_profile: "pixel_6".to_owned(),
-            abi: AndroidAbi::X86_64,
-            host_arch: HostArch::X86_64,
-            runtime_kind: RuntimeKind::AndroidEmulatorContainer,
-            image_ref: "registry.example.test/android:35".to_owned(),
-            isolation_tier: IsolationTier::VmIsolated,
-        },
+        runtime_profile_id: RuntimeProfileId::new("rtp_queue_integration")?,
         min_isolation: IsolationTier::VmIsolated,
         timeout_seconds: DurationSeconds::new(300)?,
     };
