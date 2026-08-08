@@ -148,7 +148,10 @@ async fn nats_enforces_part_four_identity_permissions() -> TestResult {
     // A worker can publish only its own control messages. The scheduler can
     // subscribe to the control wildcard and receives no cross-worker forgery.
     let mut registrations = scheduler.subscribe("control.workers.*.register").await?;
-    scheduler.flush().await?;
+    // `Client::flush` only proves that bytes reached the socket. Use an
+    // allowed request/reply on the same connection as a server-side barrier,
+    // so the worker cannot win a cross-connection race with the subscription.
+    queue_stream.info().await?;
     worker_alpha
         .publish("control.workers.wrk_alpha.register", "own".into())
         .await?;
@@ -224,7 +227,11 @@ async fn nats_enforces_part_four_identity_permissions() -> TestResult {
     // A worker cannot issue a raw JetStream acknowledgement. Ack-pending
     // remains set after its attempt and clears only after the scheduler sends
     // the exact same protocol acknowledgement.
-    let mut messages = consumer.messages().await?;
+    let mut messages = consumer
+        .stream()
+        .max_messages_per_batch(1)
+        .messages()
+        .await?;
     let message = timeout(Duration::from_secs(1), messages.next())
         .await?
         .expect("the secured queue should contain work")?;
