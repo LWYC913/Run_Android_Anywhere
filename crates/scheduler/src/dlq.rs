@@ -189,14 +189,41 @@ impl DlqPublisher {
         job_stream: &jetstream::stream::Stream,
         stream_sequence: u64,
     ) -> Result<(), DlqError> {
-        job_stream
-            .delete_message(stream_sequence)
-            .await
-            .map(|_| ())
-            .map_err(|error| DlqError::Delete {
+        let deletion = job_stream.delete_message(stream_sequence).await;
+        match deletion {
+            Ok(true) => Ok(()),
+            Ok(false) => {
+                self.accept_if_source_is_absent(
+                    job_stream,
+                    stream_sequence,
+                    "JetStream reported an unsuccessful source-message deletion".to_owned(),
+                )
+                .await
+            }
+            Err(error) => {
+                self.accept_if_source_is_absent(job_stream, stream_sequence, error.to_string())
+                    .await
+            }
+        }
+    }
+
+    async fn accept_if_source_is_absent(
+        &self,
+        job_stream: &jetstream::stream::Stream,
+        stream_sequence: u64,
+        delete_error: String,
+    ) -> Result<(), DlqError> {
+        match job_stream.get_raw_message(stream_sequence).await {
+            Err(error)
+                if error.kind() == jetstream::stream::RawMessageErrorKind::NoMessageFound =>
+            {
+                Ok(())
+            }
+            Ok(_) | Err(_) => Err(DlqError::Delete {
                 sequence: stream_sequence,
-                message: error.to_string(),
-            })
+                message: delete_error,
+            }),
+        }
     }
 
     pub const fn retry_delay() -> Duration {
