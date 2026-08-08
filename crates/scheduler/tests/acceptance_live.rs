@@ -7,8 +7,8 @@ use futures_util::StreamExt as _;
 use run_anywhere_contracts::{
     ArtifactSelection, AutomationSpec, ControlResponse, CreateJobRequest, DurationSeconds,
     HostArch, IsolationTier, JobDeadLetter, JobDispatch, JobId, JobLeaseExtension, JobMode,
-    JobOutcome, JobResult, JobState, RuntimeKind, RuntimeProfileId, Sha256, UploadKind,
-    WorkerHeartbeat, WorkerId, WorkerRegistration,
+    JobOutcome, JobResult, JobState, JobStateTransitionRequest, RuntimeKind, RuntimeProfileId,
+    Sha256, TransitionEvidence, UploadKind, WorkerHeartbeat, WorkerId, WorkerRegistration,
 };
 use run_anywhere_repository::{CreatedJob, Repository};
 use run_anywhere_scheduler::{
@@ -16,8 +16,8 @@ use run_anywhere_scheduler::{
     DlqPublisher, NoopRuntimeReaper, ProvisionedTopology, Reconciler, SchedulerMetrics,
     TopologyConfig, connect_nats, provision_topology,
     subjects::{
-        JOBS_DEAD_SUBJECT, JOBS_QUEUED_SUBJECT, job_result_subject, worker_dispatch_subject,
-        worker_heartbeat_subject, worker_registration_subject,
+        JOBS_DEAD_SUBJECT, JOBS_QUEUED_SUBJECT, job_result_subject, job_transition_subject,
+        worker_dispatch_subject, worker_heartbeat_subject, worker_registration_subject,
     },
     worker_inbox_prefix,
 };
@@ -330,6 +330,43 @@ async fn heartbeat(
         },
     )
     .await
+}
+
+async fn transition(
+    worker: &FakeWorker,
+    dispatch: &JobDispatch,
+    from: JobState,
+    to: JobState,
+) -> TestResult {
+    let response = request(
+        worker,
+        job_transition_subject(&worker.worker_id),
+        &JobStateTransitionRequest {
+            job_id: dispatch.claim.job_id.clone(),
+            worker_id: worker.worker_id.clone(),
+            lease_id: dispatch.claim.lease_id.clone(),
+            from,
+            to,
+            evidence: TransitionEvidence::default(),
+        },
+    )
+    .await?;
+    require(
+        response == ControlResponse::Accepted,
+        format!("worker transition {from:?} -> {to:?} was rejected: {response:?}"),
+    )
+}
+
+async fn advance_to_running_tests(worker: &FakeWorker, dispatch: &JobDispatch) -> TestResult {
+    for (from, to) in [
+        (JobState::Claimed, JobState::ProvisioningRuntime),
+        (JobState::ProvisioningRuntime, JobState::Booting),
+        (JobState::Booting, JobState::InstallingApk),
+        (JobState::InstallingApk, JobState::RunningTests),
+    ] {
+        transition(worker, dispatch, from, to).await?;
+    }
+    Ok(())
 }
 
 async fn publish_job(
@@ -713,6 +750,19 @@ async fn live_scheduler_restart_fencing_recovery_and_pending_work() -> TestResul
         require(
             matches!(response, ControlResponse::Heartbeat { ref extended, .. } if extended == &vec![extension_b.clone()]),
             format!("worker B heartbeat was rejected: {response:?}"),
+        )?;
+        advance_to_running_tests(&worker_b, &dispatch_b).await?;
+        let running = repository
+            .get_job_scheduling_snapshot(&main_job.id)
+            .await?
+            .ok_or_else(|| std::io::Error::other("worker B job disappeared after transitions"))?;
+        require(
+            running.job.state == JobState::RunningTests
+                && running.lease.as_ref().is_some_and(|lease| {
+                    lease.worker_id == worker_b.worker_id
+                        && lease.lease_id == dispatch_b.claim.lease_id
+                }),
+            "worker B did not reach running_tests with its exact lease",
         )?;
 
         let late_a = request(
