@@ -22,12 +22,13 @@ use run_anywhere_scheduler::{
     worker_inbox_prefix,
 };
 use serde::Serialize;
-use sqlx::PgPool;
+use sqlx::{PgPool, postgres::PgPoolOptions};
 use tokio::{
     sync::{mpsc, watch},
     task::JoinHandle,
     time::{Instant, sleep, timeout},
 };
+use url::Url;
 use uuid::Uuid;
 
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
@@ -471,30 +472,31 @@ async fn assert_no_dlq_since(
     Ok(())
 }
 
-async fn cleanup_database(
-    pool: &PgPool,
-    projects: &[run_anywhere_contracts::ProjectId],
-    workers: &[WorkerId],
-    jobs: &[JobId],
-) -> TestResult {
-    let job_ids = jobs.iter().map(ToString::to_string).collect::<Vec<_>>();
-    let project_ids = projects.iter().map(ToString::to_string).collect::<Vec<_>>();
-    let worker_ids = workers.iter().map(ToString::to_string).collect::<Vec<_>>();
-    sqlx::query(
-        "DELETE FROM outbox_messages WHERE event_key = ANY($1) \
-         OR payload->>'job_id' = ANY($1)",
-    )
-    .bind(&job_ids)
-    .execute(pool)
+fn database_url(base: &str, database_name: &str) -> TestResult<String> {
+    let mut url = Url::parse(base)?;
+    url.set_path(&format!("/{database_name}"));
+    Ok(url.into())
+}
+
+async fn create_test_database(admin_pool: &PgPool, database_name: &str) -> TestResult {
+    require(
+        database_name
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || character == '_'),
+        "generated database name is not a safe PostgreSQL identifier",
+    )?;
+    sqlx::query(&format!("CREATE DATABASE \"{database_name}\""))
+        .execute(admin_pool)
+        .await?;
+    Ok(())
+}
+
+async fn drop_test_database(admin_pool: &PgPool, database_name: &str) -> TestResult {
+    sqlx::query(&format!(
+        "DROP DATABASE IF EXISTS \"{database_name}\" WITH (FORCE)"
+    ))
+    .execute(admin_pool)
     .await?;
-    sqlx::query("DELETE FROM projects WHERE id = ANY($1)")
-        .bind(&project_ids)
-        .execute(pool)
-        .await?;
-    sqlx::query("DELETE FROM workers WHERE id = ANY($1)")
-        .bind(&worker_ids)
-        .execute(pool)
-        .await?;
     Ok(())
 }
 
@@ -543,8 +545,6 @@ async fn live_scheduler_restart_fencing_recovery_and_pending_work() -> TestResul
     config.topology.pull_batch_size = config.topology.pull_batch_size.min(8);
     config.fairness.buffer_size = config.fairness.buffer_size.max(8);
 
-    let repository = Repository::connect(config.database_url.expose_secret()).await?;
-    repository.migrate().await?;
     let scheduler_client = connect_nats(&config.nats).await?;
     let context = jetstream::new(scheduler_client.clone());
     // The durable names are intentionally the production names, so this
@@ -566,6 +566,36 @@ async fn live_scheduler_restart_fencing_recovery_and_pending_work() -> TestResul
     )?;
     let topology_config = TopologyConfig::try_from(&config)?;
     let topology = provision_topology(&context, &topology_config).await?;
+
+    // Event and audit tables are deliberately append-only, so row-level test
+    // cleanup must never disable their triggers. Run the stateful acceptance
+    // scenario in a disposable database and remove it as one database object.
+    let admin_pool = PgPoolOptions::new()
+        .max_connections(2)
+        .connect(config.database_url.expose_secret())
+        .await?;
+    let database_name = format!("raa_accept_live_{}", Uuid::new_v4().simple());
+    let test_database_url = database_url(config.database_url.expose_secret(), &database_name)?;
+    create_test_database(&admin_pool, &database_name).await?;
+    let pool = match PgPoolOptions::new()
+        .max_connections(10)
+        .connect(&test_database_url)
+        .await
+    {
+        Ok(pool) => pool,
+        Err(error) => {
+            drop_test_database(&admin_pool, &database_name).await?;
+            admin_pool.close().await;
+            return Err(error.into());
+        }
+    };
+    let repository = Repository::new(pool.clone());
+    if let Err(error) = repository.migrate().await {
+        pool.close().await;
+        drop_test_database(&admin_pool, &database_name).await?;
+        admin_pool.close().await;
+        return Err(error.into());
+    }
 
     let suffix = Uuid::new_v4().simple().to_string();
     let main_fixture =
@@ -884,10 +914,7 @@ async fn live_scheduler_restart_fencing_recovery_and_pending_work() -> TestResul
     for sequence in &queue_sequences {
         let _ = topology.job_stream.delete_message(*sequence).await;
     }
-    let jobs = vec![main_job.id, quota_job.id, capacity_job.id];
-    let projects = vec![main_fixture.project_id, capacity_fixture.project_id];
-    let workers = vec![worker_a_id, worker_b_id];
-    let database_cleanup = cleanup_database(repository.pool(), &projects, &workers, &jobs).await;
+    let jobs = [main_job.id, quota_job.id, capacity_job.id];
     let dlq_cleanup = async {
         let last_sequence = dlq_stream.info().await?.state.last_sequence;
         for sequence in (dlq_baseline + 1)..=last_sequence {
@@ -912,11 +939,14 @@ async fn live_scheduler_restart_fencing_recovery_and_pending_work() -> TestResul
         .await
         .map(|_| ())
         .map_err(|error| Box::new(error) as Box<dyn std::error::Error + Send + Sync>);
+    pool.close().await;
+    let database_cleanup = drop_test_database(&admin_pool, &database_name).await;
+    admin_pool.close().await;
 
     exercise?;
     runtime_cleanup?;
-    database_cleanup?;
     dlq_cleanup?;
     topology_restore?;
+    database_cleanup?;
     Ok(())
 }
