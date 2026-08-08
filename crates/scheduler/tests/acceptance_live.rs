@@ -498,8 +498,9 @@ async fn live_scheduler_restart_fencing_recovery_and_pending_work() -> TestResul
     config.timing.stale_worker_threshold = Duration::from_secs(2);
     config.timing.ack_wait = Duration::from_secs(3);
     // Leave enough margin for a loaded CI runner to observe the three-second
-    // JetStream redelivery while the original database lease is still valid.
-    config.timing.database_lease_ttl = Duration::from_secs(10);
+    // JetStream redelivery and run the quota/capacity assertions while the
+    // exact database lease remains valid. Production defaults to 75 seconds.
+    config.timing.database_lease_ttl = Duration::from_secs(30);
     config.timing.reconciliation_interval = Duration::from_secs(1);
     config.timing.reap_grace = Duration::from_secs(1);
     config.topology.pull_batch_size = config.topology.pull_batch_size.min(8);
@@ -759,7 +760,7 @@ async fn live_scheduler_restart_fencing_recovery_and_pending_work() -> TestResul
         let capacity_sequence = publish_job(&context, &repository, &capacity_job.id).await?;
         queue_sequences.push(capacity_sequence);
         sleep(Duration::from_millis(1_500)).await;
-        let response = heartbeat(&worker_b, extension_b, 1).await?;
+        let response = heartbeat(&worker_b, extension_b.clone(), 1).await?;
         require(
             matches!(response, ControlResponse::Heartbeat { ref extended, .. } if extended.len() == 1),
             format!("worker B capacity-saturated heartbeat was rejected: {response:?}"),
@@ -791,6 +792,14 @@ async fn live_scheduler_restart_fencing_recovery_and_pending_work() -> TestResul
         )?;
         assert_no_dlq_since(topology.dlq_stream.clone(), dlq_baseline + 1, &blocked_ids).await?;
 
+        // The assertion work above stands in for a running worker. Refresh the
+        // exact fence immediately before completion so a slow CI runner tests
+        // result ordering rather than accidentally testing lease expiry.
+        let response = heartbeat(&worker_b, extension_b.clone(), 1).await?;
+        require(
+            matches!(response, ControlResponse::Heartbeat { ref extended, .. } if extended == &vec![extension_b]),
+            format!("worker B final lease refresh was rejected: {response:?}"),
+        )?;
         let result_b = request(
             &worker_b,
             job_result_subject(&worker_b.worker_id),
